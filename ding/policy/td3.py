@@ -67,6 +67,7 @@ class TD3Policy(DDPGPolicy):
         type='td3',
         # (bool) Whether to use cuda for network.
         cuda=False,
+        multi_agent = False,
         # (bool type) on_policy: Determine whether on-policy or off-policy.
         # on-policy setting influences the behaviour of buffer.
         # Default False in TD3.

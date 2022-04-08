@@ -52,7 +52,7 @@ class SoloCommander(BaseCommander):
         self._evaluator_info = []
         self._current_buffer_id = None
         self._current_policy_id = None
-        self._last_eval_time = 0
+        self._last_eval_time = time.time() #0
         # policy_cfg must be deepcopyed
         policy_cfg = copy.deepcopy(self._cfg.policy)
         self._policy = create_policy(policy_cfg, enable_field=['command']).command_mode

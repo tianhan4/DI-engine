@@ -4,6 +4,7 @@ from copy import deepcopy
 from ding.entry import parallel_pipeline
 
 gfootball_ppo_config = dict(
+    exp_name = "gfootball_ppo_parallel"
     env=dict(
         collector_env_num=1,
         collector_episode_num=1,

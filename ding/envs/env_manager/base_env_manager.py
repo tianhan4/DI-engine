@@ -114,7 +114,6 @@ class BaseEnvManager(object):
         self._step_timeout = self._cfg.step_timeout
         self._reset_timeout = self._cfg.reset_timeout
         self._retry_waiting_time = self._cfg.retry_waiting_time
-
     @property
     def env_num(self) -> int:
         return self._env_num

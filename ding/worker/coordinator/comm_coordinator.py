@@ -307,9 +307,9 @@ class CommCoordinator(object):
             try:
                 # data task
                 data_task = self._connection_collector[collector_id].new_task({'name': 'collector_data_task'})
-                self._logger.info('collector data task begin')
+                # self._logger.info('collector data task begin, collector_id: {}'.format( collector_id))
                 data_task.start().join()
-                self._logger.info('collector data task end')
+                # self._logger.info('collector data task end')
                 if data_task.status != TaskStatus.COMPLETED:
                     # TODO(deal with fail task)
                     self._logger.error('collector data task is failed')
@@ -401,6 +401,7 @@ class CommCoordinator(object):
         close_flag = False
         learner_id = learner_task['learner_id']
         while not self._end_flag:
+            time.sleep(self._cfg.learn_policy_second)
             try:
                 # get data
                 get_data_task = self._connection_learner[learner_id].new_task({'name': 'learner_get_data_task'})

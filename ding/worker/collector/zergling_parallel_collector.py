@@ -54,7 +54,7 @@ class ZerglingParallelCollector(BaseParallelCollector):
         self._env_cfg = self._cfg.env
         env_manager = self._setup_env_manager(self._env_cfg)
         self.env_manager = env_manager
-
+        self._policy_iter = 0
         # create policy
         if self._eval_flag:
             policy = create_policy(self._cfg.policy, enable_field=['eval']).eval_mode
@@ -217,7 +217,7 @@ class ZerglingParallelCollector(BaseParallelCollector):
             'step_count': self._total_step,
             'sample_count': self._total_sample,
             'avg_time_per_episode': duration / max(1, self._total_episode),
-            'avg_time_per_step': duration / self._total_step,
+            'avg_time_per_step': duration / max(self._total_step, 1),
             'avg_time_per_train_sample': duration / max(1, self._total_sample),
             'avg_step_per_episode': self._total_step / max(1, self._total_episode),
             'avg_sample_per_episode': self._total_sample / max(1, self._total_episode),

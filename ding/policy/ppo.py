@@ -319,7 +319,7 @@ class PPOPolicy(Policy):
             data = to_device(data, self._device)
         self._collect_model.eval()
         with torch.no_grad():
-            output = self._collect_model.forward(data, mode='compute_actor_critic')
+            output = self._collect_model.forward(data, mode='compute_actor')
         if self._cuda:
             output = to_device(output, 'cpu')
         output = default_decollate(output)
@@ -342,7 +342,7 @@ class PPOPolicy(Policy):
             'next_obs': timestep.obs,
             'action': model_output['action'],
             'logit': model_output['logit'],
-            'value': model_output['value'],
+            #'value': model_output['value'],
             'reward': timestep.reward,
             'done': timestep.done,
         }
@@ -476,6 +476,7 @@ class PPOOffPolicy(Policy):
     config = dict(
         # (str) RL policy register name (refer to function "POLICY_REGISTRY").
         type='ppo',
+        multi_agent = False,
         # (bool) Whether to use cuda for network.
         cuda=False,
         on_policy=False,
@@ -681,7 +682,7 @@ class PPOOffPolicy(Policy):
             data = to_device(data, self._device)
         self._collect_model.eval()
         with torch.no_grad():
-            output = self._collect_model.forward(data, mode='compute_actor_critic')
+            output = self._collect_model.forward(data, mode='compute_actor')
         if self._cuda:
             output = to_device(output, 'cpu')
         output = default_decollate(output)
@@ -705,7 +706,7 @@ class PPOOffPolicy(Policy):
             'next_obs': timestep.obs,
             'logit': model_output['logit'],
             'action': model_output['action'],
-            'value': model_output['value'],
+            #'value': model_output['value'],
             'reward': timestep.reward,
             'done': timestep.done,
         }
@@ -766,6 +767,8 @@ class PPOOffPolicy(Policy):
         return {i: d for i, d in zip(data_id, output)}
 
     def default_model(self) -> Tuple[str, List[str]]:
+        if self._cfg.multi_agent:
+            return 'mavac', ['ding.model.template.mavac']
         return 'vac', ['ding.model.template.vac']
 
     def _monitor_vars_learn(self) -> List[str]:

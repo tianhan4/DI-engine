@@ -74,6 +74,7 @@ class DDPGPolicy(Policy):
         # on-policy setting influences the behaviour of buffer.
         # Default False in DDPG.
         on_policy=False,
+        multi_agent = False,
         # (bool) Whether use priority(priority sample, IS weight, update priority)
         # Default False in DDPG.
         priority=False,
@@ -179,7 +180,7 @@ class DDPGPolicy(Policy):
             self._target_model = model_wrap(self._target_model, wrapper_name='hybrid_argmax_sample')
         self._target_model = model_wrap(
             self._target_model,
-            wrapper_name='target',
+            wrapper_name='finer_target',
             update_type='momentum',
             update_kwargs={'theta': self._cfg.learn.target_theta}
         )
@@ -285,12 +286,13 @@ class DDPGPolicy(Policy):
             self._optimizer_actor.zero_grad()
             actor_loss.backward()
             self._optimizer_actor.step()
+            self._target_model.update_actor(self._learn_model.state_dict())
         # =============
         # after update
         # =============
         loss_dict['total_loss'] = sum(loss_dict.values())
         self._forward_learn_cnt += 1
-        self._target_model.update(self._learn_model.state_dict())
+        self._target_model.update_critic(self._learn_model.state_dict())
         if self._cfg.action_space == 'hybrid':
             action_log_value = -1.  # TODO(nyz) better way to viz hybrid action
         else:
@@ -331,12 +333,16 @@ class DDPGPolicy(Policy):
         self._collect_model = model_wrap(
             self._model,
             wrapper_name='action_noise',
-            noise_type='gauss',
+            noise_type='hybrid',
             noise_kwargs={
                 'mu': 0.0,
-                'sigma': self._cfg.collect.noise_sigma
+                'sigma': self._cfg.collect.noise_sigma,
+                'noise_exp': self._cfg.collect.noise_exp,
+                'noise_end': self._cfg.collect.noise_end,
+                'random_exp': self._cfg.collect.random_exp
             },
-            noise_range=None
+            noise_range=None,
+            noise_need_action = True
         )
         if self._cfg.action_space == 'hybrid':
             self._collect_model = model_wrap(self._collect_model, wrapper_name='hybrid_eps_greedy_multinomial_sample')
@@ -430,7 +436,10 @@ class DDPGPolicy(Policy):
         return {i: d for i, d in zip(data_id, output)}
 
     def default_model(self) -> Tuple[str, List[str]]:
-        return 'qac', ['ding.model.template.qac']
+        if self._cfg.multi_agent:
+            return 'maqac', ['ding.model.template.maqac']
+        else:
+            return 'qac', ['ding.model.template.qac']
 
     def _monitor_vars_learn(self) -> List[str]:
         r"""

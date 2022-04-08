@@ -61,6 +61,7 @@ class Coordinator(object):
         self._exp_name = cfg.main.exp_name
         self._coordinator_uid = get_task_uid()
         coor_cfg = cfg.system.coordinator
+        coor_cfg.learn_policy_second = cfg.main.policy.learn.learner.learn_policy_second
         self._collector_task_timeout = coor_cfg.collector_task_timeout
         self._learner_task_timeout = coor_cfg.learner_task_timeout
 
@@ -114,7 +115,8 @@ class Coordinator(object):
         while not self._end_flag:
             time.sleep(0.01)
             # get valid task, abandon timeout task
-            if self._collector_task_queue.empty():
+            if self._collector_task_queue.empty() or \
+                len(self._replay_buffer) == 0:
                 continue
             else:
                 collector_task, put_time = self._collector_task_queue.get()
@@ -254,10 +256,10 @@ class Coordinator(object):
         """
         self._end_flag = False
         self._interaction.start()
-        self._produce_collector_thread.start()
-        self._assign_collector_thread.start()
         self._produce_learner_thread.start()
         self._assign_learner_thread.start()
+        self._produce_collector_thread.start()
+        self._assign_collector_thread.start()
 
     def close(self) -> None:
         r"""
@@ -269,10 +271,10 @@ class Coordinator(object):
             return
         self._end_flag = True
         time.sleep(1)
-        self._produce_collector_thread.join()
-        self._assign_collector_thread.join()
         self._produce_learner_thread.join()
         self._assign_learner_thread.join()
+        self._produce_collector_thread.join()
+        self._assign_collector_thread.join()
         self._interaction.close()
         # close replay buffer
         replay_buffer_keys = list(self._replay_buffer.keys())

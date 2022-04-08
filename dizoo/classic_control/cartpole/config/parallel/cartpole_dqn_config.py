@@ -4,9 +4,9 @@ cartpole_dqn_config = dict(
     exp_name='cartpole_dqn',
     env=dict(
         collector_env_num=8,
-        collector_episode_num=2,
+        collector_episode_num=10,
         evaluator_env_num=5,
-        evaluator_episode_num=1,
+        evaluator_episode_num=100,
         stop_value=195,
     ),
     policy=dict(
@@ -34,7 +34,7 @@ cartpole_dqn_config = dict(
                 update_policy_second=3,
             ),
         ),
-        eval=dict(evaluator=dict(eval_freq=50, )),
+        eval=dict(evaluator=dict()),
         other=dict(
             eps=dict(
                 type='exp',
@@ -78,8 +78,10 @@ cartpole_dqn_create_config = dict(
         import_names=['ding.worker.learner.comm.flask_fs_learner'],
     ),
     comm_collector=dict(
-        type='flask_fs',
-        import_names=['ding.worker.collector.comm.flask_fs_collector'],
+        # type='flask_fs',
+        # import_names=['ding.worker.collector.comm.flask_fs_collector'],
+        type='flask_fs_process',
+        import_names=['flask_fs_collector_process'],
     ),
 )
 cartpole_dqn_create_config = EasyDict(cartpole_dqn_create_config)
@@ -97,4 +99,4 @@ system_config = cartpole_dqn_system_config
 
 if __name__ == '__main__':
     from ding.entry.parallel_entry import parallel_pipeline
-    parallel_pipeline([main_config, create_config, system_config], seed=9)
+    parallel_pipeline([main_config, create_config, system_config], enable_total_log = False, seed=9)

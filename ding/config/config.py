@@ -527,7 +527,7 @@ def compile_config_parallel(
     # seed
     cfg.seed = seed
     # add seed as suffix of exp_name
-    cfg.exp_name = cfg.exp_name + '_seed{}'.format(seed)
+    cfg.exp_name = cfg.main.exp_name + '_seed{}'.format(seed)
 
     if save_cfg:
         save_config(cfg, save_path)

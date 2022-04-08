@@ -142,6 +142,111 @@ class HiddenStateWrapper(IModelWrapper):
                     self._state[idx] = h[i]
 
 
+class HiddenStateACWrapper(IModelWrapper):
+
+    def __init__(
+            self, model: Any, state_num: int, save_prev_state: bool = False, init_fn: Callable = lambda: None
+    ) -> None:
+        """
+        Overview:
+            Maintain the hidden state for RNN-base actor-critic model.  
+            Each sample in a batch has its own state. \
+            Init the maintain state and state function; Then wrap the ``model.forward`` method with auto \
+            saved data ['prev_state'] input, and create the ``model.reset`` method.
+        Arguments:
+            - model(:obj:`Any`): Wrapped model class, should contain forward method.
+            - state_num (:obj:`int`): Number of states to process.
+            - save_prev_state (:obj:`bool`): Whether to output the prev state in output['prev_state'].
+            - init_fn (:obj:`Callable`): The function which is used to init every hidden state when init and reset. \
+                Default return None for hidden states.
+        .. note::
+            1. This helper must deal with an actual batch with some parts of samples, e.g: 6 samples of state_num 8.
+            2. This helper must deal with the single sample state reset.
+        """
+        super().__init__(model)
+        self._state_num = state_num
+        if model.twin_critic:
+            self._state_critic = [init_fn() for j in range(2)]
+        else:
+            self._state_critic = init_fn()
+        self._state_actor = init_fn()
+        # This is to maintain hidden states （when it comes to this wrapper, \
+        # map self._state into data['prev_value] and update next_state, store in self._state)
+        self._save_prev_state = save_prev_state
+        self._init_fn = init_fn
+
+    def reset(self, *args, **kwargs):
+        critic_state = kwargs.pop('critic_state', None)
+        actor_state = kwargs.pop('actor_state', None)
+        self.reset_state(critic_state, actor_state)
+        if hasattr(self._model, 'reset'):
+            return self._model.reset(*args, **kwargs)
+
+    def reset_state(self, critic_state: Optional[list] = None, 
+                    actor_state: Optional[list] = None):
+        assert (not self._model.twin_critic) or critic_state is None or len(critic_state) == 2 
+        if critic_state is None:
+            if self._model.twin_critic:
+                self._state_critic = [self._init_fn() for j in range(2)]
+            else:
+                self._state_critic = self._init_fn()
+        if actor_state is None:
+            actor_state = self._init_fn()
+        if critic_state is None:
+            critic_state = self._init_fn()
+            if self._model.twin_critic:
+                critic_state = [self._init_fn(), self._init_fn()]
+        if self._model.twin_critic:
+            for i in range(2):
+                self._state_critic[i] = critic_state[i]
+        else:
+            self._state_critic = critic_state
+        self._state_actor = actor_state
+            
+            
+    def forward(self, data, mode : str, **kwargs):
+        # print(f"current state: "
+        #       f"actor state: {self._state_actor}"
+        #       f"critic state: {self._state_critic}")
+        data = self.before_forward(data, mode)  # update data['prev_state'] with self._state
+        output = self._model.forward(data, mode, **kwargs)
+        if mode == 'compute_actor':
+            h = output.pop('next_state', None)
+            if h is not None:
+                self.after_forward(h, mode)  # this is to store the 'next hidden state' for each time step
+            if self._save_prev_state:
+                prev_state = get_tensor_data(data['prev_state'])
+                output['prev_state'] = prev_state
+            return output
+        else:
+            h = output.pop('next_state', None)
+            if h is not None:
+                self.after_forward(h, mode)  # this is to store the 'next hidden state' for each time step
+            if self._save_prev_state:
+                prev_state = get_tensor_data(data['prev_state'])
+                output['prev_state'] = prev_state
+            return output
+            
+            
+    def before_forward(self, data: dict, mode: str) -> Tuple[dict, dict]:            
+        if mode == 'compute_actor':
+            data['prev_state'] = self._state_actor
+            return data
+        elif mode == 'compute_critic':
+            data['prev_state'] = self._state_critic
+            return data
+        else:
+            raise Exception("no exist mode")
+            
+    def after_forward(self, h: Any, mode : str) -> None:
+        if mode == 'compute_actor':
+            self._state_actor = h
+        elif mode == 'compute_critic':
+            self._state_critic = h
+        else:
+            raise Exception("no exist mode")
+
+
 def sample_action(logit=None, prob=None):
     if prob is None:
         prob = torch.softmax(logit, dim=-1)
@@ -557,12 +662,14 @@ class ActionNoiseWrapper(IModelWrapper):
             action_range: Optional[dict] = {
                 'min': -1,
                 'max': 1
-            }
+            },
+            noise_need_action: bool = False
     ) -> None:
         super().__init__(model)
         self.noise_generator = create_noise_generator(noise_type, noise_kwargs)
         self.noise_range = noise_range
         self.action_range = action_range
+        self._noise_need_action = noise_need_action
 
     def forward(self, *args, **kwargs):
         output = self._model.forward(*args, **kwargs)
@@ -573,6 +680,8 @@ class ActionNoiseWrapper(IModelWrapper):
             assert isinstance(action, torch.Tensor)
             action = self.add_noise(action)
             output[key] = action
+            # print("input obs:", *args)
+            # print("output:", output)
         return output
 
     def add_noise(self, action: torch.Tensor) -> torch.Tensor:
@@ -584,7 +693,10 @@ class ActionNoiseWrapper(IModelWrapper):
         Returns:
             - noised_action (:obj:`torch.Tensor`): Action processed after adding noise and clipping.
         """
-        noise = self.noise_generator(action.shape, action.device)
+        if self._noise_need_action:
+            noise = self.noise_generator(action, action.shape, action.device)
+        else:
+            noise = self.noise_generator(action.shape, action.device)
         if self.noise_range is not None:
             noise = noise.clamp(self.noise_range['min'], self.noise_range['max'])
         action += noise
@@ -598,6 +710,177 @@ class ActionNoiseWrapper(IModelWrapper):
             Reset noise generator.
         """
         pass
+
+
+
+class ActionTriggerNoiseWrapper(IModelWrapper):
+    r"""
+    Overview:
+        Add noise to collector's action output; Do clips on both generated noise and action after adding noise.
+    Interfaces:
+        register, __init__, add_noise, reset
+    Arguments:
+        - model (:obj:`Any`): Wrapped model class. Should contain ``forward`` method.
+        - noise_type (:obj:`str`): The type of noise that should be generated, support ['gauss', 'ou'].
+        - noise_kwargs (:obj:`dict`): Keyword args that should be used in noise init. Depends on ``noise_type``.
+        - noise_range (:obj:`Optional[dict]`): Range of noise, used for clipping.
+        - action_range (:obj:`Optional[dict]`): Range of action + noise, used for clip, default clip to [-1, 1].
+    """
+
+    def __init__(
+            self,
+            model: Any,
+            noise_type: str = 'gauss',
+            noise_kwargs: dict = {},
+            trigger_exp: int = 10000,
+            noise_range: Optional[dict] = None,
+            action_range: Optional[dict] = {
+                'min': -1,
+                'max': 1
+            },
+            noise_need_action: bool = False
+    ) -> None:
+        super().__init__(model)
+        self.noise_generator = create_noise_generator(noise_type, noise_kwargs)
+        self.noise_range = noise_range
+        self.action_range = action_range
+        self.trigger_exp = trigger_exp
+        self.trigger_step = trigger_exp
+        self._noise_need_action = noise_need_action
+
+    def forward(self, *args, **kwargs):
+        output = self._model.forward(*args, **kwargs)
+        output['action'] = self.add_action_noise(output['action'])
+        output['trigger'] = self.add_trigger_noise(output['trigger'])
+        return output
+
+    def add_action_noise(self, action: torch.Tensor) -> torch.Tensor:
+        r"""
+        Overview:
+            Generate noise and clip noise if needed. Add noise to action and clip action if needed.
+        Arguments:
+            - action (:obj:`torch.Tensor`): Model's action output.
+        Returns:
+            - noised_action (:obj:`torch.Tensor`): Action processed after adding noise and clipping.
+        """
+        if self._noise_need_action:
+            noise = self.noise_generator(action, action.shape, action.device)
+        else:
+            noise = self.noise_generator(action.shape, action.device)
+        if self.noise_range is not None:
+            noise = noise.clamp(self.noise_range['min'], self.noise_range['max'])
+        action += noise
+        if self.action_range is not None:
+            action = action.clamp(self.action_range['min'], self.action_range['max'])
+        return action
+
+    def add_trigger_noise(self, trigger: torch.Tensor) -> torch.Tensor:
+        self.trigger_step -= 1
+        # print("trigger before", trigger)
+        device = trigger.device
+        shape = trigger.shape
+        if np.random.uniform(0,1) < self.trigger_step/float(self.trigger_exp):  
+            new_trigger = (torch.rand(shape, device = device) > 0.5).to(torch.float32)
+            print(f"shuffle trigger from {trigger} to {new_trigger}")
+        # print("trigger after", trigger)
+        return new_trigger
+
+    def reset(self) -> None:
+        r"""
+        Overview:
+            Reset noise generator.
+        """
+        pass
+
+
+class FinerTargetNetworkWrapper(IModelWrapper):
+    r"""
+    Overview:
+        Maintain and update the target network (critic and actor, seperately)
+    Interfaces:
+        update, reset
+    """
+
+    def __init__(self, model: Any, update_type: str, update_kwargs: dict):
+        super().__init__(model)
+        assert update_type in ['momentum', 'assign']
+        self._update_type = update_type
+        self._update_kwargs = update_kwargs
+        self._update_count = 0
+
+    def reset(self, *args, **kwargs):
+        target_update_count = kwargs.pop('target_update_count', None)
+        self.reset_state(target_update_count)
+        if hasattr(self._model, 'reset'):
+            return self._model.reset(*args, **kwargs)
+
+    def update_actor(self, state_dict: dict, direct: bool = False) -> None:
+        r"""
+        Overview:
+            Update the target network state dict
+
+        Arguments:
+            - state_dict (:obj:`dict`): the state_dict from learner model
+            - direct (:obj:`bool`): whether to update the target network directly, \
+                if true then will simply call the load_state_dict method of the model
+        """
+        if direct:
+            self._model.load_state_dict(state_dict, strict=True)
+            self._update_count = 0
+        else:
+            if self._update_type == 'assign':
+                if (self._update_count + 1) % self._update_kwargs['freq'] == 0:
+                    for name, p in self._model.named_parameters():
+                        # default theta = 0.001
+                        if 'actor' in name:
+                            p.data = state_dict[name]
+                self._update_count += 1
+            elif self._update_type == 'momentum':
+                theta = self._update_kwargs['theta']
+                for name, p in self._model.named_parameters():
+                    if "actor" in name:
+                    # default theta = 0.001
+                        p.data = (1 - theta) * p.data + theta * state_dict[name]
+                    
+
+    def update_critic(self, state_dict: dict, direct: bool = False) -> None:
+        r"""
+        Overview:
+            Update the target network state dict
+
+        Arguments:
+            - state_dict (:obj:`dict`): the state_dict from learner model
+            - direct (:obj:`bool`): whether to update the target network directly, \
+                if true then will simply call the load_state_dict method of the model
+        """
+        if direct:
+            self._model.load_state_dict(state_dict, strict=True)
+            self._update_count = 0
+        else:
+            if self._update_type == 'assign':        
+                if (self._update_count + 1) % self._update_kwargs['freq'] == 0:
+                    for name, p in self._model.named_parameters():
+                        # default theta = 0.001
+                        if 'critic' in name:
+                            p.data = state_dict[name]
+                self._update_count += 1
+            elif self._update_type == 'momentum':
+                theta = self._update_kwargs['theta']
+                for name, p in self._model.named_parameters():
+                    # default theta = 0.001
+                    if 'critic' in name:
+                        p.data = (1 - theta) * p.data + theta * state_dict[name]
+
+    def reset_state(self, target_update_count: int = None) -> None:
+        r"""
+        Overview:
+            Reset the update_count
+        Arguments:
+            target_update_count (:obj:`int`): reset target update count value.
+        """
+        if target_update_count is not None:
+            self._update_count = target_update_count
+
 
 
 class TargetNetworkWrapper(IModelWrapper):
@@ -673,6 +956,7 @@ class TeacherNetworkWrapper(IModelWrapper):
 wrapper_name_map = {
     'base': BaseModelWrapper,
     'hidden_state': HiddenStateWrapper,
+    'hidden_state_ac' : HiddenStateACWrapper,
     'argmax_sample': ArgmaxSampleWrapper,
     'hybrid_argmax_sample': HybridArgmaxSampleWrapper,
     'eps_greedy_sample': EpsGreedySampleWrapper,
@@ -686,8 +970,10 @@ wrapper_name_map = {
     'hybrid_deterministic_argmax_sample': HybridDeterministicArgmaxSampleWrapper,
     'multinomial_sample': MultinomialSampleWrapper,
     'action_noise': ActionNoiseWrapper,
+    'action_trigger_noise': ActionTriggerNoiseWrapper,
     # model wrapper
     'target': TargetNetworkWrapper,
+    'finer_target' : FinerTargetNetworkWrapper,
     'teacher': TeacherNetworkWrapper,
 }
 

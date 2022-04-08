@@ -84,7 +84,7 @@ class SACDiscretePolicy(Policy):
         priority_IS_weight=False,
         # (int) Number of training samples(randomly collected) in replay buffer when training starts.
         # Default 10000 in SAC.
-        random_collect_size=10000,
+        # random_collect_size=10000,
         model=dict(
             # (bool type) twin_critic: Determine whether to use double-soft-q-net for target q computation.
             # Please refer to TD3 about Clipped Double-Q Learning trick, which learns two Q-functions instead of one .
@@ -160,7 +160,7 @@ class SACDiscretePolicy(Policy):
             # You can use either "n_sample" or "n_episode" in actor.collect.
             # Get "n_sample" samples per collect.
             # Default n_sample to 1.
-            n_sample=1,
+            # n_sample=1,
             # (int) Cut trajectories into pieces with length "unroll_len".
             unroll_len=1,
         ),
@@ -585,7 +585,7 @@ class SACPolicy(Policy):
         priority_IS_weight=False,
         # (int) Number of training samples(randomly collected) in replay buffer when training starts.
         # Default 10000 in SAC.
-        random_collect_size=10000,
+        # random_collect_size=10000,
         multi_agent=False,
         model=dict(
             # (bool type) twin_critic: Determine whether to use double-soft-q-net for target q computation.
@@ -670,7 +670,7 @@ class SACPolicy(Policy):
             # You can use either "n_sample" or "n_episode" in actor.collect.
             # Get "n_sample" samples per collect.
             # Default n_sample to 1.
-            n_sample=1,
+            # n_sample=1,
             # (int) Cut trajectories into pieces with length "unroll_len".
             unroll_len=1,
         ),
@@ -946,7 +946,21 @@ class SACPolicy(Policy):
             Use action noise for exploration.
         """
         self._unroll_len = self._cfg.collect.unroll_len
-        self._collect_model = model_wrap(self._model, wrapper_name='base')
+        # self._collect_model = model_wrap(self._model, wrapper_name='base')
+        
+        self._collect_model = model_wrap(
+            self._model,
+            wrapper_name='action_noise',
+            noise_type='hybrid',
+            noise_kwargs={
+                'mu': 0.0,
+                'sigma': self._cfg.collect.noise_sigma,
+                'noise_exp': self._cfg.collect.noise_exp,
+                'noise_end': self._cfg.collect.noise_end
+            },
+            noise_range=None,
+            noise_need_action = True
+        )
         self._collect_model.reset()
 
     def _forward_collect(self, data: dict) -> dict:
