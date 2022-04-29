@@ -77,7 +77,7 @@ def nstep_return(data: namedtuple, gamma: float, nstep: int, value_gamma: Option
     for i in range(1, nstep):
         reward_factor[i] = gamma * reward_factor[i - 1]
     reward_factor = view_similar(reward_factor, reward)
-    reward = reward.mul(reward_factor).sum(0)
+    reward = reward.mul(reward_factor).sum(0).reshape(next_value.shape)
     if value_gamma is None:
         return_ = reward + (gamma ** nstep) * next_value * (1 - done)
     else:

@@ -148,7 +148,7 @@ def default_get(
         return value
 
 
-def list_split(data: list, step: int) -> List[list]:
+def list_split(data: list, step: int, overlap: int = 0) -> List[list]:
     r"""
     Overview:
         Split list of data by step.
@@ -167,16 +167,16 @@ def list_split(data: list, step: int) -> List[list]:
     if len(data) < step:
         return [], data
     ret = []
-    divide_num = len(data) // step
-    for i in range(divide_num):
-        start, end = i * step, (i + 1) * step
-        ret.append(data[start:end])
-    if divide_num * step < len(data):
-        residual = data[divide_num * step:]
-    else:
+    start, end  = 0, step
+    while end <= len(data):
+        ret.append(data[start : end])
+        start += (step - overlap) 
+        end = start + step
+    if start >= len(data):
         residual = None
+    else:
+        residual = data[start:]
     return ret, residual
-
 
 def error_wrapper(fn, default_ret, warning_msg=""):
     r"""

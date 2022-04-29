@@ -239,6 +239,7 @@ class DDPGPolicy(Policy):
             q_value_dict['q_value_twin'] = q_value[1].mean()
         else:
             q_value_dict['q_value'] = q_value.mean()
+        print("q_value:", q_value_dict['q_value'])
         # target q value.
         with torch.no_grad():
             next_actor_data = self._target_model.forward(next_obs, mode='compute_actor')
@@ -258,6 +259,7 @@ class DDPGPolicy(Policy):
             td_error_per_sample = (td_error_per_sample1 + td_error_per_sample2) / 2
         else:
             # DDPG: single critic network
+            # print("check td_data", q_value, target_q_value, reward, data['done'], data['weight'])
             td_data = v_1step_td_data(q_value, target_q_value, reward, data['done'], data['weight'])
             critic_loss, td_error_per_sample = v_1step_td_error(td_data, self._gamma)
             loss_dict['critic_loss'] = critic_loss

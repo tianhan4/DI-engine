@@ -135,6 +135,7 @@ class Adder(object):
             cls,
             data: List[Dict[str, Any]],
             unroll_len: int,
+            overlap: int = 0,
             last_fn_type: str = 'last',
             null_transition: Optional[dict] = None
     ) -> List[Dict[str, Any]]:
@@ -157,7 +158,7 @@ class Adder(object):
             return data
         else:
             # cut data into pieces whose length is unroll_len
-            split_data, residual = list_split(data, step=unroll_len)
+            split_data, residual = list_split(data, step=unroll_len, overlap=overlap)
 
             def null_padding():
                 template = copy.deepcopy(residual[0])
