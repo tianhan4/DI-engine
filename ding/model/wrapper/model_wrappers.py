@@ -178,42 +178,68 @@ class HiddenStateACWrapper(IModelWrapper):
     def reset(self, *args, **kwargs):
         critic_state = kwargs.pop('critic_state', None)
         actor_state = kwargs.pop('actor_state', None)
-        self.reset_state(critic_state, actor_state)
+        agent_num = kwargs.pop('agent_num', 1)
+        self.reset_state(critic_state, actor_state, agent_num)
         if hasattr(self._model, 'reset'):
             return self._model.reset(*args, **kwargs)
 
     def reset_state(self, critic_state: Optional[list] = None, 
-                    actor_state: Optional[list] = None):
+                    actor_state: Optional[list] = None, agent_num: Optional[int] = 1):
         assert (not self._model.twin_critic) or critic_state is None or len(critic_state) == 2 
-        if critic_state is None:
+        self.agent_num = agent_num
+        if agent_num > 1:
+            if critic_state is None:
+                if self._model.twin_critic:
+                    self._state_critic = [[self._init_fn() for j in range(2)] for k in range(agent_num)]
+                else:
+                    self._state_critic = [self._init_fn() for k in range(agent_num)]
+            if actor_state is None:
+                actor_state = [self._init_fn() for k in range(agent_num)]
+            if critic_state is None:
+                critic_state = [self._init_fn() for k in range(agent_num)]
+                if self._model.twin_critic:
+                    critic_state = [[self._init_fn(), self._init_fn()] for k in range(agent_num)]
             if self._model.twin_critic:
-                self._state_critic = [self._init_fn() for j in range(2)]
+                for i in range(2):
+                    self._state_critic[i] = critic_state[i]
             else:
-                self._state_critic = self._init_fn()
-        if actor_state is None:
-            actor_state = self._init_fn()
-        if critic_state is None:
-            critic_state = self._init_fn()
-            if self._model.twin_critic:
-                critic_state = [self._init_fn(), self._init_fn()]
-        if self._model.twin_critic:
-            for i in range(2):
-                self._state_critic[i] = critic_state[i]
-        else:
-            self._state_critic = critic_state
-        self._state_actor = actor_state
+                self._state_critic = critic_state
+            self._state_actor = actor_state
             
+        else:
+            if critic_state is None:
+                if self._model.twin_critic:
+                    self._state_critic = [self._init_fn() for j in range(2)]
+                else:
+                    self._state_critic = self._init_fn()
+            if actor_state is None:
+                actor_state = self._init_fn()
+            if critic_state is None:
+                critic_state = self._init_fn()
+                if self._model.twin_critic:
+                    critic_state = [self._init_fn(), self._init_fn()]
+            if self._model.twin_critic:
+                for i in range(2):
+                    self._state_critic[i] = critic_state[i]
+            else:
+                self._state_critic = critic_state
+            self._state_actor = actor_state
+                
             
     def forward(self, data, mode : str, **kwargs):
         # print(f"current state: "
         #       f"actor state: {self._state_actor}"
         #       f"critic state: {self._state_critic}")
-        data = self.before_forward(data, mode)  # update data['prev_state'] with self._state
+        if self.agent_num > 1:
+            agent_id = kwargs.pop('agent_id', 0)
+        else:
+            agent_id = None
+        data = self.before_forward(data, mode, agent_id)  # update data['prev_state'] with self._state
         output = self._model.forward(data, mode, **kwargs)
         if mode == 'compute_actor':
             h = output.pop('next_state', None)
             if h is not None:
-                self.after_forward(h, mode)  # this is to store the 'next hidden state' for each time step
+                self.after_forward(h, mode, agent_id)  # this is to store the 'next hidden state' for each time step
             if self._save_prev_state:
                 prev_state = get_tensor_data(data['prev_state'])
                 output['prev_state'] = prev_state
@@ -221,30 +247,39 @@ class HiddenStateACWrapper(IModelWrapper):
         else:
             h = output.pop('next_state', None)
             if h is not None:
-                self.after_forward(h, mode)  # this is to store the 'next hidden state' for each time step
+                self.after_forward(h, mode, agent_id)  # this is to store the 'next hidden state' for each time step
             if self._save_prev_state:
                 prev_state = get_tensor_data(data['prev_state'])
                 output['prev_state'] = prev_state
             return output
             
             
-    def before_forward(self, data: dict, mode: str) -> Tuple[dict, dict]:            
+    def before_forward(self, data: dict, mode: str, agent_id: int) -> Tuple[dict, dict]:   
         if mode == 'compute_actor':
-            data['prev_state'] = self._state_actor
+            data['prev_state'] = self._state_actor if agent_id is None else self._state_actor[agent_id]
             return data
         elif mode == 'compute_critic':
-            data['prev_state'] = self._state_critic
+            data['prev_state'] = self._state_critic if agent_id is None else self._state_critic[agent_id]
             return data
         else:
             raise Exception("no exist mode")
             
-    def after_forward(self, h: Any, mode : str) -> None:
-        if mode == 'compute_actor':
-            self._state_actor = h
-        elif mode == 'compute_critic':
-            self._state_critic = h
+    def after_forward(self, h: Any, mode : str, agent_id: int) -> None:
+        if agent_id is None:
+            if mode == 'compute_actor':
+                self._state_actor = h
+            elif mode == 'compute_critic':
+                self._state_critic = h
+            else:
+                raise Exception("no exist mode")
         else:
-            raise Exception("no exist mode")
+            if mode == 'compute_actor':
+                self._state_actor[agent_id] = h
+            elif mode == 'compute_critic':
+                self._state_critic[agent_id] = h
+            else:
+                raise Exception("no exist mode")
+            
 
 
 def sample_action(logit=None, prob=None):
