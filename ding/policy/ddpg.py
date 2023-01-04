@@ -1,6 +1,7 @@
 from typing import List, Dict, Any, Tuple, Union
 from collections import namedtuple
 import torch
+from torch.optim.lr_scheduler import ExponentialLR
 import copy
 
 from ding.torch_utils import Adam, to_device
@@ -168,6 +169,10 @@ class DDPGPolicy(Policy):
             self._model.critic.parameters(),
             lr=self._cfg.learn.learning_rate_critic,
         )
+        self._schedular_actor = ExponentialLR(self._optimizer_actor, gamma = self._cfg.learn.learning_rate_gamma ** self._cfg.learn.actor_update_freq)
+        self._schedular_critic = ExponentialLR(self._optimizer_critic, gamma = self._cfg.learn.learning_rate_gamma)
+        
+        
         self._reward_batch_norm = self._cfg.reward_batch_norm
 
         self._gamma = self._cfg.learn.discount_factor
@@ -271,6 +276,7 @@ class DDPGPolicy(Policy):
             if 'critic' in k:
                 loss_dict[k].backward()
         self._optimizer_critic.step()
+        self._schedular_critic.step()
         # ===============================
         # actor learn forward and update
         # ===============================
@@ -288,6 +294,7 @@ class DDPGPolicy(Policy):
             self._optimizer_actor.zero_grad()
             actor_loss.backward()
             self._optimizer_actor.step()
+            self._schedular_actor.step()
             self._target_model.update_actor(self._learn_model.state_dict())
         # =============
         # after update
@@ -300,8 +307,8 @@ class DDPGPolicy(Policy):
         else:
             action_log_value = data['action'].mean()
         return {
-            'cur_lr_actor': self._optimizer_actor.defaults['lr'],
-            'cur_lr_critic': self._optimizer_critic.defaults['lr'],
+            'cur_lr_actor': self._schedular_actor.get_last_lr()[0],
+            'cur_lr_critic': self._schedular_critic.get_last_lr()[0],
             # 'q_value': np.array(q_value).mean(),
             'action': action_log_value,
             'priority': td_error_per_sample.abs().tolist(),
