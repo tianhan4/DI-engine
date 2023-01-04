@@ -66,6 +66,91 @@ class BaseNoise(ABC):
         """
         raise NotImplementedError
 
+<<<<<<< Updated upstream
+=======
+class BaseNoise2(ABC):
+    def __init__(self) -> None:
+        super().__init__()
+
+    @abstractmethod
+    def __call__(self, action: torch.Tensor, shape: tuple, device: str) -> torch.Tensor:
+        raise NotImplementedError
+
+class HybridNoise(BaseNoise2):
+    def __init__(self, mu: float = 0.0, sigma: float = 1.0,
+                 noise_exp: int = 10000, random_exp: int = 10000, noise_end: float = 0.05) -> None:
+
+        super(HybridNoise, self).__init__()
+        self._mu = mu
+        assert sigma >= 0, "GaussianNoise's sigma should be positive."
+        self._sigma = sigma
+        self._noise_exp = noise_exp
+        self._random_exp = random_exp
+        self._noise_end = noise_end
+        self._noise_interval = sigma - noise_end
+        self._running_step = 0
+        assert self._noise_interval >= 0, "HybridNoise's sigma should be larger than the end sigma."
+    
+    def __call__(self, action: torch.Tensor, shape: tuple, device: str) -> torch.Tensor:
+        left_random_step = self._random_exp - self._running_step
+        left_gaussian_step = self._noise_exp - self._running_step
+        if np.random.uniform(0,1) < left_random_step/float(self._random_exp):    
+            random_noise = torch.rand(shape, device=device) * 2 - 1
+            return random_noise - action
+        else:
+            if left_gaussian_step < 0:
+                left_gaussian_step = 0
+            sigma = self._noise_end + left_gaussian_step * self._noise_interval/self._noise_exp
+            gaussian_noise = torch.randn(shape, device=device)
+            gaussian_noise = gaussian_noise * sigma + self._mu
+            return gaussian_noise
+
+
+
+class DecayGaussianNoise(BaseNoise):
+    r"""
+    Overview:
+        Derived class for generating decaying gaussian noise, which satisfies :math:`X \sim N(\mu, \sigma^2)`
+    Interface:
+        __init__, __call__
+    """
+
+    def __init__(self, mu: float = 0.0, sigma: float = 1.0,
+                 noise_exp: int = 10000, noise_end: float = 0.05) -> None:
+        """
+        Overview:
+            Initialize :math:`\mu` and :math:`\sigma` in Gaussian Distribution
+        Arguments:
+            - mu (:obj:`float`):  :math:`\mu` , mean value
+            - sigma (:obj:`float`): :math:`\sigma` , standard deviation, should be positive
+        """
+        super(DecayGaussianNoise, self).__init__()
+        self._mu = mu
+        assert sigma >= 0, "GaussianNoise's sigma should be positive."
+        self._sigma = sigma
+        self._noise_exp = noise_exp
+        self._noise_end = noise_end
+        self._noise_interval = sigma - noise_end
+        assert self._noise_interval >= 0, "DecayGaussianNoise's sigma should be larger than the end sigma."
+
+    def __call__(self, shape: tuple, device: str) -> torch.Tensor:
+        """
+        Overview:
+            Generate decaying gaussian noise according to action tensor's shape, device
+        Arguments:
+            - shape (:obj:`tuple`): size of the action tensor, output noise's size should be the same
+            - device (:obj:`str`): device of the action tensor, output noise's device should be the same as it
+        Returns:
+            - noise (:obj:`torch.Tensor`): generated action noise, \
+                have the same shape and device with the input action tensor
+        """
+        if self._sigma <= self._noise_end:
+            pass
+        else:
+            self._sigma -= self._noise_interval/self._noise_exp
+        noise = torch.randn(shape, device=device)
+        noise = noise * self._sigma + self._mu
+        return noise
 
 class GaussianNoise(BaseNoise):
     r"""
