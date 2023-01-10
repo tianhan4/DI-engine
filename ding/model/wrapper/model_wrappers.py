@@ -406,17 +406,22 @@ class EpsGreedySampleWrapper(IModelWrapper):
         else:
             mask = None
         action = []
+        # print("eps!:", eps)
         for i, l in enumerate(logit):
             if np.random.random() > eps:
                 action.append(l.argmax(dim=-1))
             else:
+                
                 if mask:
                     action.append(sample_action(prob=mask[i].float()))
                 else:
                     action.append(torch.randint(0, l.shape[-1], size=l.shape[:-1]))
+                # print("random!:", action)
         if len(action) == 1:
             action, logit = action[0], logit[0]
         output['action'] = action
+        
+        # print("output actions!:", output['action'])
         return output
 
 

@@ -377,12 +377,12 @@ class R2D2Policy(Policy):
         # for r2d2, this hidden_state wrapper is to add the 'prev hidden state' for each transition.
         # Note that collect env forms a batch and the key is added for the batch simultaneously.
         self._collect_model = model_wrap(
-            self._model, wrapper_name='hidden_state', state_num=self._cfg.collect.env_num, save_prev_state=True
+            self._model, wrapper_name='hidden_state', state_num=self._cfg.collect.env_num * self._cfg.collect.max_agent_num , save_prev_state=True
         )
         self._collect_model = model_wrap(self._collect_model, wrapper_name='eps_greedy_sample')
         self._collect_model.reset()
 
-    def _forward_collect(self, data: dict, eps: float) -> dict:
+    def _forward_collect(self, data: dict, eps: float, data_id: List[int] = None) -> dict:
         r"""
         Overview:
             Forward function for collect mode with eps_greedy
@@ -395,7 +395,8 @@ class R2D2Policy(Policy):
         ReturnsKeys
             - necessary: ``action``
         """
-        data_id = list(data.keys())
+        if data_id is None:
+            data_id = list(data.keys())
         data = default_collate(list(data.values()))
         if self._cuda:
             data = to_device(data, self._device)
@@ -445,6 +446,8 @@ class R2D2Policy(Policy):
         Returns:
             - samples (:obj:`dict`): The training samples generated
         """
+        for i in range(len(data)):
+            data[i]["action"] = data[i]["action"].long()
         data = get_nstep_return_data(data, self._nstep, gamma=self._gamma)
         return get_train_sample(data, self._unroll_len_add_burnin_step)
 
@@ -454,11 +457,11 @@ class R2D2Policy(Policy):
             Evaluate mode init method. Called by ``self.__init__``.
             Init eval model with argmax strategy.
         """
-        self._eval_model = model_wrap(self._model, wrapper_name='hidden_state', state_num=self._cfg.eval.env_num)
+        self._eval_model = model_wrap(self._model, wrapper_name='hidden_state', state_num=self._cfg.eval.env_num * self._cfg.eval.max_agent_num)
         self._eval_model = model_wrap(self._eval_model, wrapper_name='argmax_sample')
         self._eval_model.reset()
 
-    def _forward_eval(self, data: dict) -> dict:
+    def _forward_eval(self, data: dict, data_id: List[int] = None) -> dict:
         r"""
         Overview:
             Forward function of eval mode, similar to ``self._forward_collect``.
