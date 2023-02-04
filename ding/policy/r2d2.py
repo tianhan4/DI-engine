@@ -263,7 +263,11 @@ class R2D2Policy(Policy):
                 - total_loss (:obj:`float`): The calculated loss
         """
         # forward
-        data = self._data_preprocess_learn(data)  # output datatype: Dict
+        try:
+            data = self._data_preprocess_learn(data)  # output datatype: Dict
+        except Exception as e:
+            print("Get a exception, data:", data)
+            raise e
         self._learn_model.train()
         self._target_model.train()
         # use the hidden state in timestep=0
@@ -449,7 +453,7 @@ class R2D2Policy(Policy):
         for i in range(len(data)):
             data[i]["action"] = data[i]["action"].long()
         data = get_nstep_return_data(data, self._nstep, gamma=self._gamma)
-        return get_train_sample(data, self._unroll_len_add_burnin_step)
+        return get_train_sample(data, self._unroll_len_add_burnin_step, overlap = self._cfg.unroll_overlap)
 
     def _init_eval(self) -> None:
         r"""
