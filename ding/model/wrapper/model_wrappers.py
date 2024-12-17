@@ -718,10 +718,12 @@ class ActionNoiseWrapper(IModelWrapper):
             key = 'action' if 'action' in output else 'action_args'
             action = output[key]
             assert isinstance(action, torch.Tensor)
+            
+            #print("input:", action)
             action = self.add_noise(action)
             output[key] = action
             # print("input obs:", *args)
-            # print("output:", output)
+            #print("output:", output)
         return output
 
     def add_noise(self, action: torch.Tensor) -> torch.Tensor:

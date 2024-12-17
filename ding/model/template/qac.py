@@ -143,7 +143,7 @@ class QAC(nn.Module):
                 )
             )
 
-    def forward(self, inputs: Union[torch.Tensor, Dict], mode: str) -> Dict:
+    def forward(self, inputs: Union[torch.Tensor, Dict], mode: str, **kwargs) -> Dict:
         """
         Overview:
             Use observation and action tensor to predict output.
@@ -202,7 +202,7 @@ class QAC(nn.Module):
         assert mode in self.mode, "not support forward mode: {}/{}".format(mode, self.mode)
         return getattr(self, mode)(inputs)
 
-    def compute_actor(self, inputs: torch.Tensor) -> Dict:
+    def compute_actor(self, inputs: torch.Tensor, **kwargs) -> Dict:
         """
         Overview:
             Use encoded embedding tensor to predict output.
@@ -256,7 +256,7 @@ class QAC(nn.Module):
             action_args = self.actor[1](inputs)
             return {'logit': logit['logit'], 'action_args': action_args['pred']}
 
-    def compute_critic(self, inputs: Dict) -> Dict:
+    def compute_critic(self, inputs: Dict, **kwargs) -> Dict:
         r"""
         Overview:
             Execute parameter updates with ``compute_critic`` mode
@@ -414,7 +414,7 @@ class DiscreteQAC(nn.Module):
                 )
             )
 
-    def forward(self, inputs: Union[torch.Tensor, Dict], mode: str) -> Dict:
+    def forward(self, inputs: Union[torch.Tensor, Dict], mode: str, **kwargs) -> Dict:
         r"""
         Overview:
             Use bbservation and action tensor to predict output.
