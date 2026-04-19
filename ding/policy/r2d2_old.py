@@ -1,7 +1,9 @@
 import copy
+import math
 from collections import namedtuple
 from typing import List, Dict, Any, Tuple, Union, Optional
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -109,29 +111,23 @@ class R2D2Policy(Policy):
             supervised_metrics_only=False,
             # (float) Weight for the supervised metrics loss.
             metrics_loss_weight=1.0,
-            # Retained for backward compatibility; point-estimate metrics prediction does not use calibration.
+            # (dict) Periodic per-metric temperature calibration for heteroscedastic metrics.
             metrics_calibration=dict(
-                enable=False,
-                interval=200,
-                holdout_ratio=0.2,
-                ema_decay=0.0,
-                min_log_t=-2.0,
-                max_log_t=2.0,
+                enable=False, # 是否启用温度校准
+                interval=200, # 校准间隔 100~500
+                holdout_ratio=0.2, # 保留比例 0.1~0.2
+                ema_decay=0.0, # EMA 衰减率 0.9~0.99
+                min_log_t=-2.0, # 最小对数温度最小缩放约 0.13x
+                max_log_t=2.0, # 最大对数温度 最大缩放约 7.38x
             ),
             # Preference w-augmentation for smoother utility behavior.
             metrics_w_aug=dict(
-                enable=False, # 是否启用 preference w-augmentation
+                enable=True, # 是否启用 preference w-augmentation
                 num_samples=4, # 采样次数
                 noise_std=0.05, # 噪声标准差
                 normalize_w=True, # 是否归一化
                 clamp_min=0.0, # 最小值
                 loss_weight=0.1, # 损失权重
-            ),
-            # (dict) Optional explicit random re-initialization for ensemble heads.
-            # Useful when you want to guarantee each ensemble head starts from a different seed.
-            multi_head_random_init=dict(
-                enable=True,
-                seed=23613,
             ),
             # ==============================================================
             # The following configs are algorithm-specific
@@ -151,25 +147,18 @@ class R2D2Policy(Policy):
             env_num=None,
             # (str) Exploration type in collect. 'eps_greedy' uses eps passed into _forward_collect.
             # 'ucb' uses MC-dropout to estimate mean/std of per-action utility (logit),
-            # then selects argmax(mean + ucb_beta * std).
+            # then selects argmax(mean + ucb_beta * std), optionally mixed with eps random.
             exploration_type='eps_greedy',  # eps_greedy|ucb|thompson
             ucb_beta=1.0,
             mc_dropout_samples=8,
-            # Point-estimate metrics prediction does not model aleatoric uncertainty, so this stays inactive.
+            # (float) Risk-averse penalty coefficient for aleatoric uncertainty of utility u = w·m.
+            # If > 0 and the model returns `pred_metrics_log_std`, action score is penalized by `risk_alpha * sigma_u`.risk_alpha 的推荐起始值为 1.0，合理的调节范围在 0.5 到 2.0 之间。
             risk_alpha=0.0,
         ),
         eval=dict(
             # `env_num` is used in hidden state, should equal to that one in env config.
             # User should specify this value in user config.
             env_num=None,
-            # Eval action selection:
-            # - 'collect': reuse collect-time scoring
-            # - 'mean': pure mean argmax
-            # - 'mean_risk': mean - risk_alpha * sigma_u
-            action_selection='collect',  # collect|mean|mean_risk
-            exploration_type=None,
-            ucb_beta=None,
-            risk_alpha=None,
         ),
         other=dict(
             eps=dict(
@@ -226,7 +215,6 @@ class R2D2Policy(Policy):
         self._burnin_step = self._cfg.burnin_step
         self._value_rescale = self._cfg.learn.value_rescale
         self._init_metrics_calibration()
-        self._maybe_random_init_multi_heads()
 
         self._target_model = copy.deepcopy(self._model)
         # here we should not adopt the 'assign' mode of target network here because the reset bug
@@ -257,28 +245,6 @@ class R2D2Policy(Policy):
         self._learn_model.reset()
         self._target_model.reset()
 
-    def _reset_module_parameters(self, module: torch.nn.Module) -> None:
-        if hasattr(module, 'reset_parameters') and callable(module.reset_parameters):
-            module.reset_parameters()
-
-    def _maybe_random_init_multi_heads(self) -> None:
-        cfg = getattr(self._cfg.learn, 'multi_head_random_init', None)
-        if not cfg or not bool(getattr(cfg, 'enable', False)):
-            return
-        heads = getattr(self._model, 'heads', None)
-        if heads is None or len(heads) <= 1:
-            return
-
-        seed = getattr(cfg, 'seed', None)
-        with torch.random.fork_rng():
-            base_seed = None if seed is None else int(seed)
-            for idx, head in enumerate(heads):
-                if base_seed is not None:
-                    torch.manual_seed(base_seed + idx)
-                    if torch.cuda.is_available():
-                        torch.cuda.manual_seed_all(base_seed + idx)
-                head.apply(self._reset_module_parameters)
-
     def _extract_obs_tensor(self, obs: Any) -> torch.Tensor:
         if isinstance(obs, dict):
             if 'agent_state' in obs:
@@ -307,14 +273,83 @@ class R2D2Policy(Policy):
             )
         return obs_tensor[..., -metrics_dim:]
 
-    def _init_metrics_calibration(self) -> None:
-        return
+    def _calibration_scalar_dict(self) -> Dict[str, float]:
+        calib_log_t = None if self._metrics_log_t is None else self._metrics_log_t.detach().cpu().tolist()
+        out = {'metrics_calib_log_t': calib_log_t}
+        for i in range(self._metrics_dim):
+            log_t = 0.0
+            if isinstance(calib_log_t, list) and len(calib_log_t) == self._metrics_dim:
+                log_t = float(calib_log_t[i])
+            out[f'metrics_calib_log_t_{i}'] = log_t
+            out[f'metrics_calib_t_{i}'] = float(math.exp(log_t))
+        return out
 
-    def _compute_metrics_loss(
+    def _init_metrics_calibration(self) -> None:
+        cfg = getattr(self._cfg.learn, 'metrics_calibration', None)
+        self._metrics_calibration_enabled = bool(cfg and getattr(cfg, 'enable', False))
+        self._metrics_calibration_interval = int(getattr(cfg, 'interval', 200)) if cfg else 0
+        self._metrics_calibration_holdout_ratio = float(getattr(cfg, 'holdout_ratio', 0.2)) if cfg else 0.0
+        self._metrics_calibration_ema = float(getattr(cfg, 'ema_decay', 0.0)) if cfg else 0.0
+        self._metrics_calibration_min_log_t = float(getattr(cfg, 'min_log_t', -2.0)) if cfg else -2.0
+        self._metrics_calibration_max_log_t = float(getattr(cfg, 'max_log_t', 2.0)) if cfg else 2.0
+        self._metrics_calibration_step = 0
+        if self._metrics_calibration_enabled:
+            device = self._device if hasattr(self, '_device') else next(self._model.parameters()).device
+            self._metrics_log_t = torch.zeros(self._metrics_dim, device=device)
+        else:
+            self._metrics_log_t = None
+
+    def _apply_metrics_calibration(self, pred_log_std: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if not self._metrics_calibration_enabled or pred_log_std is None:
+            return pred_log_std
+        view_shape = [1] * (pred_log_std.dim() - 1) + [self._metrics_log_t.numel()]
+        return pred_log_std + self._metrics_log_t.view(*view_shape)
+
+    def _maybe_calibrate_metrics(
         self,
         pred: torch.Tensor,
         pred_log_std: Optional[torch.Tensor],
         target: torch.Tensor,
+    ) -> None:
+        if not self._metrics_calibration_enabled or pred_log_std is None:
+            return
+        self._metrics_calibration_step += 1
+        if self._metrics_calibration_interval <= 0:
+            return
+        if self._metrics_calibration_step % self._metrics_calibration_interval != 0:
+            return
+        with torch.no_grad():
+            pred = pred.detach().reshape(-1, pred.shape[-1])
+            pred_log_std = pred_log_std.detach().reshape(-1, pred_log_std.shape[-1])
+            target = target.detach().reshape(-1, target.shape[-1])
+            n = pred.shape[0]
+            if n < 2:
+                return
+            holdout_ratio = float(self._metrics_calibration_holdout_ratio)
+            if 0.0 < holdout_ratio < 1.0: #在线 Batch 内校准,随机采样
+                k = max(1, int(n * holdout_ratio))
+                idx = torch.randperm(n, device=pred.device)[:k]
+                pred = pred[idx]
+                pred_log_std = pred_log_std[idx]
+                target = target[idx]
+            # 我们希望校准后的方差能够等于真实误差，即：$V_{actual} \approx t^2 \cdot V_{pred}$ （其中 $t$ 就是我们要找的温度系数）。推导比率：$t^2 = \frac{V_{actual}}{V_{pred}}$ （也就是代码中的 ratio）。两边同时取自然对数：$\log(t^2) = \log(ratio)$。化简得到我们要的对数系数：$2 \log(t) = \log(ratio) \implies \log(t) = 0.5 \cdot \log(ratio)$。这就是 new_log_t = 0.5 * torch.log(ratio) 的由来！如果模型过于自信（实际误差 diff2 远大于 预测方差 var），ratio 就会大于 1，new_log_t 就是正数，在后续应用时就会把模型的标准差强行放大。
+            diff2 = (target - pred) ** 2 # 实际误差平方 (真实方差)
+            var = torch.exp(2.0 * pred_log_std) # 模型预测的方差
+            ratio = (diff2 / (var + 1e-12)).mean(dim=0).clamp(min=1e-6)
+            new_log_t = 0.5 * torch.log(ratio)
+            new_log_t = new_log_t.clamp(
+                min=self._metrics_calibration_min_log_t, max=self._metrics_calibration_max_log_t
+            )
+            if self._metrics_calibration_ema > 0.0:
+                ema = float(self._metrics_calibration_ema)
+                new_log_t = ema * self._metrics_log_t + (1.0 - ema) * new_log_t
+            self._metrics_log_t.copy_(new_log_t)
+
+    def _compute_metrics_loss(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        pred_log_std: Optional[torch.Tensor] = None,
         reduction: str = 'mean',
     ) -> torch.Tensor:
         cfg = self._cfg.learn
@@ -331,24 +366,25 @@ class R2D2Policy(Policy):
             weight = w.view(*view_shape)
 
         diff = pred - target
-        if loss_type in ['huber', 'smooth_l1', 'gaussian_nll_huber']:
+        if loss_type in ['huber', 'smooth_l1']:
             beta = float(getattr(cfg, 'metrics_huber_beta', 1.0))
             abs_diff = diff.abs()
-            huber_elem = torch.where(abs_diff < beta, 0.5 * (diff ** 2) / beta, abs_diff - 0.5 * beta)
-        else:
-            huber_elem = None
-
-        if loss_type in ['gaussian_nll', 'gaussian_nll_huber']:
+            loss_elem = torch.where(abs_diff < beta, 0.5 * (diff ** 2) / beta, abs_diff - 0.5 * beta)
+        elif loss_type in ['gaussian_nll', 'nll', 'gaussian_nll_huber']:
             if pred_log_std is None:
-                raise ValueError("metrics_loss_type requires `pred_log_std` from Gaussian metrics head.")
+                raise KeyError("metrics_loss_type=gaussian_nll requires pred_metrics_log_std from the model head.")
             var = torch.exp(2.0 * pred_log_std)
-            loss_elem = 0.5 * (diff ** 2) / (var + 1e-8) + pred_log_std
+            nll = 0.5 * (diff ** 2) / var + pred_log_std
             if loss_type == 'gaussian_nll_huber':
+                beta = float(getattr(cfg, 'metrics_huber_beta', 1.0))
                 huber_weight = float(getattr(cfg, 'metrics_huber_weight', 0.1))
-                loss_elem = loss_elem + huber_weight * huber_elem
-        elif loss_type in ['huber', 'smooth_l1']:
-            loss_elem = huber_elem
+                abs_diff = diff.abs()
+                huber = torch.where(abs_diff < beta, 0.5 * (diff ** 2) / beta, abs_diff - 0.5 * beta)
+                loss_elem = nll + huber_weight * huber
+            else:
+                loss_elem = nll
         else:
+            # default to MSE
             loss_elem = diff ** 2
 
         if weight is not None:
@@ -389,6 +425,24 @@ class R2D2Policy(Policy):
             effective_weight = effective_weight * mask
         return weighted_loss.sum() / (effective_weight.sum() + 1e-6)
 
+    def _supervised_weight_stats(self, sample_weight: Optional[torch.Tensor]) -> Dict[str, float]:
+        out = {
+            'priority_is_weighted_loss': 0.0,
+            'is_weight_mean': 1.0,
+            'is_weight_max': 1.0,
+            'is_weight_min': 1.0,
+        }
+        if sample_weight is None:
+            return out
+        weight = sample_weight.detach().float().reshape(-1)
+        if weight.numel() == 0:
+            return out
+        out['priority_is_weighted_loss'] = 1.0
+        out['is_weight_mean'] = float(weight.mean().item())
+        out['is_weight_max'] = float(weight.max().item())
+        out['is_weight_min'] = float(weight.min().item())
+        return out
+
     def _compute_uncertainty_metrics_stats(
         self,
         pred: torch.Tensor,
@@ -397,45 +451,77 @@ class R2D2Policy(Policy):
         prefix: str = 'metrics_',
     ) -> Dict[str, float]:
         """
-        Compute coverage and calibration diagnostics for Gaussian metrics heads.
-        Returns stable zero defaults when aleatoric predictions are unavailable.
+        Compute monitoring metrics for heteroscedastic Gaussian predictions:
+        - NLL (mean and per-dim)
+        - Coverage for central credible intervals p in {50, 80, 90, 95}%
+        - Calibration error as mean(|emp_cov(p) - p|) over those p values
         """
-        out: Dict[str, float] = {
-            prefix + 'coverage_50': 0.0,
-            prefix + 'coverage_80': 0.0,
-            prefix + 'coverage_90': 0.0,
-            prefix + 'coverage_95': 0.0,
-            prefix + 'calib_err': 0.0,
-        }
+        # Always return a stable key set so DI-engine monitor_vars doesn't break.
+        out: Dict[str, float] = {}
+        dim = int(pred.shape[-1])
+        out[prefix + 'has_log_std'] = 1.0 if pred_log_std is not None else 0.0
+        out[prefix + 'nll'] = 0.0
+        out[prefix + 'calib_err'] = 0.0
+        for i in range(dim):
+            out[prefix + f'nll_dim{i}'] = 0.0
+            out[prefix + f'calib_err_dim{i}'] = 0.0
+        for p in [50, 80, 90, 95]:
+            out[prefix + f'coverage_{p}'] = 0.0
+            for i in range(dim):
+                out[prefix + f'coverage_{p}_dim{i}'] = 0.0
+
         if pred_log_std is None:
             return out
 
         with torch.no_grad():
-            dim = int(pred.shape[-1])
-            pred = pred.detach().reshape(-1, dim).float()
-            target = target.detach().reshape(-1, dim).float()
-            pred_log_std = pred_log_std.detach().reshape(-1, dim).float().clamp(min=-10.0, max=10.0)
-            std = torch.exp(pred_log_std)
+            pred = pred.detach().reshape(-1, dim)
+            target = target.detach().reshape(-1, dim)
+            pred_log_std = pred_log_std.detach().reshape(-1, dim)
+            # Robust clamp to avoid inf var; calibration may shift log_std.
+            pred_log_std = pred_log_std.clamp(min=-10.0, max=10.0)
             diff = pred - target
+            var = torch.exp(2.0 * pred_log_std)
+            nll = 0.5 * (diff ** 2) / (var + 1e-12) + pred_log_std
+            nll_dim = nll.mean(dim=0)
+            out[prefix + 'nll'] = float(nll_dim.mean().item())
+            for i in range(dim):
+                out[prefix + f'nll_dim{i}'] = float(nll_dim[i].item())
+
+            std = torch.exp(pred_log_std)
+            # Central interval coverage based on Normal quantiles.
             ps = [0.50, 0.80, 0.90, 0.95]
             norm = torch.distributions.Normal(
                 torch.tensor(0.0, device=pred.device, dtype=pred.dtype),
                 torch.tensor(1.0, device=pred.device, dtype=pred.dtype),
             )
-            coverage_values = []
+            covs = []
+            covs_dim = []
             for p in ps:
-                z = norm.icdf(torch.tensor(0.5 + p / 2.0, device=pred.device, dtype=pred.dtype))
-                coverage = float((diff.abs() <= (z * std)).float().mean().item())
-                coverage_values.append(coverage)
-                out[prefix + f'coverage_{int(p * 100)}'] = coverage
-            out[prefix + 'calib_err'] = sum(abs(c - p) for c, p in zip(coverage_values, ps)) / len(ps)
+                q = torch.tensor(0.5 + p / 2.0, device=pred.device, dtype=pred.dtype)
+                z = norm.icdf(q)
+                inside = (diff.abs() <= (z * std)).float()  # (N, D)
+                cov_dim = inside.mean(dim=0)
+                cov = float(cov_dim.mean().item())
+                covs.append(cov)
+                covs_dim.append(cov_dim)
+                out[prefix + f'coverage_{int(p * 100)}'] = cov
+                for i in range(dim):
+                    out[prefix + f'coverage_{int(p * 100)}_dim{i}'] = float(cov_dim[i].item())
+
+            # Calibration error: mean absolute gap between empirical coverage and nominal p.
+            calib_err = float(np.mean([abs(c - p) for c, p in zip(covs, ps)]))
+            out[prefix + 'calib_err'] = calib_err
+            for i in range(dim):
+                covs_i = [float(cd[i].item()) for cd in covs_dim]
+                out[prefix + f'calib_err_dim{i}'] = float(np.mean([abs(c - p) for c, p in zip(covs_i, ps)]))
+
         return out
 
     def _compute_metrics_loss_analysis_stats(
         self,
         pred: torch.Tensor,
-        pred_log_std: Optional[torch.Tensor],
         target: torch.Tensor,
+        pred_log_std: Optional[torch.Tensor],
         prefix: str = 'metrics_loss_',
     ) -> Dict[str, float]:
         """
@@ -453,15 +539,15 @@ class R2D2Policy(Policy):
             prefix + 'rmse': 0.0,
             prefix + 'diff_std': 0.0,
             prefix + 'loss_elem_mean': 0.0,
+            prefix + 'nll_mean': 0.0,
             prefix + 'huber_mean': 0.0,
             prefix + 'huber_scaled_mean': 0.0,
             prefix + 'huber_quadratic_frac': 0.0,
-            prefix + 'pred_log_std_mean': 0.0,
-            prefix + 'pred_log_std_std': 0.0,
-            prefix + 'aleatoric_std_mean': 0.0,
-            prefix + 'nll_mean': 0.0,
+            prefix + 'std_mean': 0.0,
+            prefix + 'var_mean': 0.0,
             prefix + 'beta': beta,
             prefix + 'huber_weight': huber_weight,
+            prefix + 'use_nll': 1.0 if loss_type in ['gaussian_nll', 'nll', 'gaussian_nll_huber'] else 0.0,
             prefix + 'use_huber': 1.0 if loss_type in ['huber', 'smooth_l1', 'gaussian_nll_huber'] else 0.0,
         }
 
@@ -474,30 +560,28 @@ class R2D2Policy(Policy):
             out[prefix + 'diff_std'] = float(diff.std(unbiased=False).item())
 
             loss_elem = diff ** 2
+            nll = None
             huber = None
 
-            if loss_type in ['huber', 'smooth_l1']:
-                huber = torch.where(abs_diff < beta, 0.5 * (diff ** 2) / beta, abs_diff - 0.5 * beta)
-                out[prefix + 'huber_mean'] = float(huber.mean().item())
-                out[prefix + 'huber_scaled_mean'] = float((huber_weight * huber).mean().item())
-                out[prefix + 'huber_quadratic_frac'] = float((abs_diff < beta).float().mean().item())
-                loss_elem = huber
-            elif loss_type == 'gaussian_nll_huber':
-                huber = torch.where(abs_diff < beta, 0.5 * (diff ** 2) / beta, abs_diff - 0.5 * beta)
-                out[prefix + 'huber_mean'] = float(huber.mean().item())
-                out[prefix + 'huber_scaled_mean'] = float((huber_weight * huber).mean().item())
-                out[prefix + 'huber_quadratic_frac'] = float((abs_diff < beta).float().mean().item())
+            if loss_type in ['gaussian_nll', 'nll', 'gaussian_nll_huber'] and pred_log_std is not None:
+                pred_log_std = pred_log_std.detach().float().clamp(min=-10.0, max=10.0)
+                var = torch.exp(2.0 * pred_log_std)
+                std = torch.exp(pred_log_std)
+                nll = 0.5 * (diff ** 2) / (var + 1e-12) + pred_log_std
+                loss_elem = nll
+                out[prefix + 'nll_mean'] = float(nll.mean().item())
+                out[prefix + 'std_mean'] = float(std.mean().item())
+                out[prefix + 'var_mean'] = float(var.mean().item())
 
-            if pred_log_std is not None:
-                pls = pred_log_std.detach().float()
-                out[prefix + 'pred_log_std_mean'] = float(pls.mean().item())
-                out[prefix + 'pred_log_std_std'] = float(pls.std(unbiased=False).item())
-                out[prefix + 'aleatoric_std_mean'] = float(pls.exp().mean().item())
-                if loss_type in ['gaussian_nll', 'gaussian_nll_huber']:
-                    var = torch.exp(2.0 * pls)
-                    nll = 0.5 * (diff ** 2) / (var + 1e-8) + pls
-                    out[prefix + 'nll_mean'] = float(nll.mean().item())
-                    loss_elem = nll if loss_type == 'gaussian_nll' else (nll + huber_weight * huber)
+            if loss_type in ['huber', 'smooth_l1', 'gaussian_nll_huber']:
+                huber = torch.where(abs_diff < beta, 0.5 * (diff ** 2) / beta, abs_diff - 0.5 * beta)
+                out[prefix + 'huber_mean'] = float(huber.mean().item())
+                out[prefix + 'huber_scaled_mean'] = float((huber_weight * huber).mean().item())
+                out[prefix + 'huber_quadratic_frac'] = float((abs_diff < beta).float().mean().item())
+                if loss_type in ['huber', 'smooth_l1']:
+                    loss_elem = huber
+                elif nll is not None:
+                    loss_elem = nll + huber_weight * huber
 
             out[prefix + 'loss_elem_mean'] = float(loss_elem.mean().item())
 
@@ -536,50 +620,6 @@ class R2D2Policy(Policy):
             loss = loss + F.mse_loss(u_tilde, u)
         loss = loss / max(num_samples, 1)
         return weight * loss, loss
-
-    def _compute_action_coverage_and_gap_stats(
-        self,
-        action: Optional[torch.Tensor],
-        pred_metrics_all: Optional[torch.Tensor],
-        max_actions: int = 3,
-    ) -> Dict[str, float]:
-        stats = {}
-        action_num = max_actions
-        if torch.is_tensor(pred_metrics_all) and pred_metrics_all.dim() >= 4:
-            action_num = min(max_actions, int(pred_metrics_all.shape[-2]))
-        for idx in range(max_actions):
-            stats[f'action_frac_{idx}'] = 0.0
-        stats.update({
-            'pred_gap_l1_01': 0.0,
-            'pred_gap_l1_02': 0.0,
-            'pred_gap_l1_12': 0.0,
-            'pred_gap_l2_01': 0.0,
-            'pred_gap_l2_02': 0.0,
-            'pred_gap_l2_12': 0.0,
-            'pred_gap_l1_mean': 0.0,
-        })
-
-        if torch.is_tensor(action) and action.numel() > 0:
-            action_flat = action.reshape(-1)
-            for idx in range(action_num):
-                stats[f'action_frac_{idx}'] = float((action_flat == idx).float().mean().item())
-
-        if torch.is_tensor(pred_metrics_all) and pred_metrics_all.dim() >= 4 and pred_metrics_all.shape[-2] >= 2:
-            pm = pred_metrics_all.float()
-            pair_defs = [(0, 1), (0, 2), (1, 2)]
-            pair_l1 = []
-            for i, j in pair_defs:
-                if i >= pm.shape[-2] or j >= pm.shape[-2]:
-                    continue
-                diff = pm[..., i, :] - pm[..., j, :]
-                l1 = diff.abs().mean()
-                l2 = diff.pow(2).mean().sqrt()
-                stats[f'pred_gap_l1_{i}{j}'] = float(l1.item())
-                stats[f'pred_gap_l2_{i}{j}'] = float(l2.item())
-                pair_l1.append(l1)
-            if len(pair_l1) > 0:
-                stats['pred_gap_l1_mean'] = float(torch.stack(pair_l1).mean().item())
-        return stats
 
     def _compute_grad_norm(self, norm_type: float = 2.0) -> float:
         norm_type = float(norm_type)
@@ -747,26 +787,39 @@ class R2D2Policy(Policy):
             true_metrics = data['metrics']  # expected (T, B, D)
             action = data['action']  # (T, B)
             sample_weight = data.get('weight', None)
+            supervised_weight_stats = self._supervised_weight_stats(sample_weight)
 
             if true_metrics.dim() == 2:
                 true_metrics = true_metrics.unsqueeze(0)
-            pred_metrics_log_std_taken = None
             # If ensemble heads exist, supervise each head and average the loss to preserve diversity.
+            pred_metrics_log_std_taken_for_stats = None
             if 'pred_metrics_ens' in learn_output:
+                # print("Using ensemble heads for metrics prediction and loss calculation.")
                 pred_metrics_ens = learn_output['pred_metrics_ens']  # (E,T,B,A,D)其中 T=时间步，B=批次大小，A=动作空间，D=指标维度）
+                pred_metrics_log_std_ens = learn_output.get('pred_metrics_log_std_ens', None)
                 action_for_metrics = action.unsqueeze(0).unsqueeze(-1).unsqueeze(-1).expand(
                     pred_metrics_ens.shape[0], -1, -1, 1, pred_metrics_ens.shape[-1]
                 )#(1,T,B,1,1)->(E,T,B,1,D)
                 pred_metrics_taken_ens = pred_metrics_ens.gather(3, action_for_metrics).squeeze(3)  # 取出执行action的预测metrics(E,T,B,D)
+                if pred_metrics_log_std_ens is not None:
+                    pred_metrics_log_std_taken_ens = pred_metrics_log_std_ens.gather(
+                        3, action_for_metrics
+                    ).squeeze(3)# 取出执行action的预测metrics的log_std(E,T,B,D)
+                    pred_metrics_log_std_taken_ens_raw = pred_metrics_log_std_taken_ens
+                    self._maybe_calibrate_metrics(
+                        pred_metrics_taken_ens.mean(dim=0),
+                        pred_metrics_log_std_taken_ens_raw.mean(dim=0),
+                        true_metrics,
+                    )
+                    pred_metrics_log_std_taken_ens = self._apply_metrics_calibration(pred_metrics_log_std_taken_ens_raw)
+                    pred_metrics_log_std_taken_for_stats = pred_metrics_log_std_taken_ens.mean(dim=0)#(T,B,D)
+                else:
+                    pred_metrics_log_std_taken_ens = None
                 true_metrics_ens = true_metrics.unsqueeze(0).expand_as(pred_metrics_taken_ens)
-                pred_metrics_log_std_taken_ens = None
-                if 'pred_metrics_log_std_ens' in learn_output:
-                    pred_metrics_log_std_ens = learn_output['pred_metrics_log_std_ens']
-                    pred_metrics_log_std_taken_ens = pred_metrics_log_std_ens.gather(3, action_for_metrics).squeeze(3)
                 loss_per_sample = self._compute_metrics_loss(
                     pred_metrics_taken_ens.float(),
-                    None if pred_metrics_log_std_taken_ens is None else pred_metrics_log_std_taken_ens.float(),
                     true_metrics_ens.float(),
+                    pred_log_std=pred_metrics_log_std_taken_ens,
                     reduction='none',
                 )
                 bootstrap_prob = float(getattr(self._cfg.learn, 'metrics_bootstrap_prob', 1.0))
@@ -780,19 +833,26 @@ class R2D2Policy(Policy):
                 else:
                     metrics_loss = self._reduce_supervised_loss(loss_per_sample, sample_weight=sample_weight)
                 pred_metrics_taken = pred_metrics_taken_ens.mean(dim=0)  # (T,B,D), for logging/priority
-                if pred_metrics_log_std_taken_ens is not None:
-                    pred_metrics_log_std_taken = pred_metrics_log_std_taken_ens.mean(dim=0)
             else:
                 pred_metrics = learn_output['pred_metrics']  # (T, B, A, D)
+                pred_metrics_log_std = learn_output.get('pred_metrics_log_std', None)
                 action_for_metrics = action.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, pred_metrics.shape[-1])
                 pred_metrics_taken = pred_metrics.gather(2, action_for_metrics).squeeze(2)  # (T,B,D)
-                if 'pred_metrics_log_std' in learn_output:
-                    pred_metrics_log_std = learn_output['pred_metrics_log_std']
-                    pred_metrics_log_std_taken = pred_metrics_log_std.gather(2, action_for_metrics).squeeze(2)
+                if pred_metrics_log_std is not None:
+                    pred_metrics_log_std_taken_raw = pred_metrics_log_std.gather(2, action_for_metrics).squeeze(2)
+                    self._maybe_calibrate_metrics(
+                        pred_metrics_taken,
+                        pred_metrics_log_std_taken_raw,
+                        true_metrics,
+                    )
+                    pred_metrics_log_std_taken = self._apply_metrics_calibration(pred_metrics_log_std_taken_raw)
+                    pred_metrics_log_std_taken_for_stats = pred_metrics_log_std_taken
+                else:
+                    pred_metrics_log_std_taken = None
                 loss_per_sample = self._compute_metrics_loss(
                     pred_metrics_taken.float(),
-                    None if pred_metrics_log_std_taken is None else pred_metrics_log_std_taken.float(),
                     true_metrics.float(),
+                    pred_log_std=pred_metrics_log_std_taken,
                     reduction='none',
                 )
                 metrics_loss_unweighted = loss_per_sample.mean()
@@ -816,17 +876,17 @@ class R2D2Policy(Policy):
             self._optimizer.step()
             self._target_model.update(self._learn_model.state_dict())
 
+            stats = self._compute_uncertainty_metrics_stats(
+                pred_metrics_taken.float(),
+                true_metrics.float(),
+                pred_metrics_log_std_taken_for_stats.float() if pred_metrics_log_std_taken_for_stats is not None else None,
+                prefix='metrics_',
+            )
             loss_stats = self._compute_metrics_loss_analysis_stats(
                 pred_metrics_taken.float(),
-                None if pred_metrics_log_std_taken is None else pred_metrics_log_std_taken.float(),
                 true_metrics.float(),
+                pred_metrics_log_std_taken_for_stats.float() if pred_metrics_log_std_taken_for_stats is not None else None,
                 prefix='metrics_loss_',
-            )
-            uncertainty_stats = self._compute_uncertainty_metrics_stats(
-                pred_metrics_taken.float(),
-                true_metrics.float(),
-                None if pred_metrics_log_std_taken is None else pred_metrics_log_std_taken.float(),
-                prefix='metrics_',
             )
 
             # Diagnostics for monitor vars (compute meaningful values in supervised mode).
@@ -908,10 +968,16 @@ class R2D2Policy(Policy):
             if 'logit_std' in learn_output and torch.is_tensor(learn_output['logit_std']):
                 logit_std_t0 = learn_output['logit_std'][0]
                 epistemic_std_taken_t0 = float(logit_std_t0[batch_range, action[0]].mean().item())
-            coverage_gap_stats = self._compute_action_coverage_and_gap_stats(
-                action,
-                learn_output.get('pred_metrics', None),
-            )
+
+            aleatoric_sigma_u_taken_t0 = 0.0
+            if pred_metrics_log_std_taken_for_stats is not None and torch.is_tensor(obs_tensor):
+                w_t0 = self._extract_preference_w(obs_tensor)[0]
+                log_std_t0 = torch.clamp(pred_metrics_log_std_taken_for_stats[0], min=-10.0, max=10.0)
+                std_t0 = torch.exp(log_std_t0)
+                sigma_u_sq = ((w_t0 * std_t0) ** 2).sum(dim=-1)
+                aleatoric_sigma_u_taken_t0 = float(torch.sqrt(sigma_u_sq + 1e-8).mean().item())
+
+            calib_log_t_scalars = self._calibration_scalar_dict()
 
             return {
                 'cur_lr': self._optimizer.defaults['lr'],
@@ -919,11 +985,14 @@ class R2D2Policy(Policy):
                 'total_loss': loss.item(),
                 'metrics_loss': metrics_loss.item(),
                 'metrics_loss_unweighted': float(metrics_loss_unweighted.item()),
+                'is_weighted_metrics_loss': metrics_loss.item(),
                 'weighted_minus_unweighted_metrics_loss': float(metrics_loss.item() - metrics_loss_unweighted.item()),
                 'metrics_w_aug_loss': 0.0 if w_aug_loss_raw is None else float(w_aug_loss_raw.item()),
                 'priority': td_error_per_sample.tolist(),
+                **supervised_weight_stats,
+                **stats,
                 **loss_stats,
-                **uncertainty_stats,
+                **calib_log_t_scalars,
                 'q_s_taken-a_t0': 0.0 if q_s_a_t0 is None else q_s_a_t0.mean().item(),
                 'target_q_s_max-a_t0': 0.0 if target_q_s_a_t0 is None else target_q_s_a_t0.mean().item(),
                 'q_s_a-mean_t0': q_s_a_mean_t0,
@@ -934,7 +1003,7 @@ class R2D2Policy(Policy):
                 'u_true_t0': 0.0 if u_true_t0 is None else u_true_t0.mean().item(),
                 'u_abs_err_t0': 0.0 if u_abs_err_t0 is None else u_abs_err_t0.mean().item(),
                 'epistemic_std_taken_t0': epistemic_std_taken_t0,
-                **coverage_gap_stats,
+                'aleatoric_sigma_u_taken_t0': aleatoric_sigma_u_taken_t0,
             }
 
         if len(data['burnin_nstep_obs']) != 0:
@@ -994,17 +1063,22 @@ class R2D2Policy(Policy):
         # compute metrics MSE loss if present
         metrics_loss_val = 0.0
         w_aug_loss_raw = None
-        loss_stats = self._compute_metrics_loss_analysis_stats(
+        stats = self._compute_uncertainty_metrics_stats(
+            torch.zeros((1, 1, self._metrics_dim), device=q_value.device, dtype=q_value.dtype),
             torch.zeros((1, 1, self._metrics_dim), device=q_value.device, dtype=q_value.dtype),
             None,
+            prefix='metrics_',
+        )
+        loss_stats = self._compute_metrics_loss_analysis_stats(
             torch.zeros((1, 1, self._metrics_dim), device=q_value.device, dtype=q_value.dtype),
+            torch.zeros((1, 1, self._metrics_dim), device=q_value.device, dtype=q_value.dtype),
+            None,
             prefix='metrics_loss_',
         )
         if 'metrics' in data and 'pred_metrics' in learn_output:
             true_metrics = data['metrics']  # (T, B, D)
             pred_metrics = learn_output['pred_metrics']  # (T, B, A, D)
             T, B = action.shape
-            pred_metrics_log_std_taken = None
             
             if true_metrics.dim() == 2:
                 true_metrics = true_metrics.unsqueeze(0) # handle shape mismatch
@@ -1013,27 +1087,36 @@ class R2D2Policy(Policy):
             action_for_metrics = action.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, pred_metrics.shape[-1])
             # get the predicted metrics for the taken action
             pred_metrics_taken = pred_metrics.gather(2, action_for_metrics).squeeze(2)
-            if 'pred_metrics_log_std' in learn_output:
-                pred_metrics_log_std = learn_output['pred_metrics_log_std']
-                pred_metrics_log_std_taken = pred_metrics_log_std.gather(2, action_for_metrics).squeeze(2)
+
+            pred_metrics_log_std = learn_output.get('pred_metrics_log_std', None)
+            if pred_metrics_log_std is not None:
+                pred_metrics_log_std_taken_raw = pred_metrics_log_std.gather(2, action_for_metrics).squeeze(2)
+                self._maybe_calibrate_metrics(
+                    pred_metrics_taken,
+                    pred_metrics_log_std_taken_raw,
+                    true_metrics,
+                )
+                pred_metrics_log_std_taken = self._apply_metrics_calibration(pred_metrics_log_std_taken_raw)
+                stats = self._compute_uncertainty_metrics_stats(
+                    pred_metrics_taken.float(),
+                    true_metrics.float(),
+                    pred_metrics_log_std_taken.float(),
+                    prefix='metrics_',
+                )
+            else:
+                pred_metrics_log_std_taken = None
 
             loss_stats = self._compute_metrics_loss_analysis_stats(
                 pred_metrics_taken.float(),
-                None if pred_metrics_log_std_taken is None else pred_metrics_log_std_taken.float(),
                 true_metrics.float(),
+                pred_metrics_log_std_taken.float() if pred_metrics_log_std_taken is not None else None,
                 prefix='metrics_loss_',
-            )
-            uncertainty_stats = self._compute_uncertainty_metrics_stats(
-                pred_metrics_taken.float(),
-                true_metrics.float(),
-                None if pred_metrics_log_std_taken is None else pred_metrics_log_std_taken.float(),
-                prefix='metrics_',
             )
 
             metrics_loss = self._compute_metrics_loss(
                 pred_metrics_taken.float(),
-                None if pred_metrics_log_std_taken is None else pred_metrics_log_std_taken.float(),
                 true_metrics.float(),
+                pred_log_std=pred_metrics_log_std_taken,
             )
             loss = loss + metrics_loss
             metrics_loss_val = metrics_loss.item()
@@ -1101,29 +1184,44 @@ class R2D2Policy(Policy):
 
         # Uncertainty signals (if the model supports them).
         epistemic_std_taken_t0 = None
+        aleatoric_sigma_u_taken_t0 = None
         with torch.no_grad():
             if 'logit_std' in learn_output:
                 logit_std_t0 = learn_output['logit_std'][0]  # (B, A)
                 epistemic_std_taken_t0 = logit_std_t0[batch_range, action[0]].mean().item()
-        coverage_gap_stats = self._compute_action_coverage_and_gap_stats(
-            action,
-            learn_output.get('pred_metrics', None),
-        )
+            # Aleatoric uncertainty over utility u = w·m.
+            if 'pred_metrics_log_std' in learn_output:
+                obs_tensor = self._extract_obs_tensor(data['main_obs'])
+                if torch.is_tensor(obs_tensor):
+                    w = self._extract_preference_w(obs_tensor)[0]  # (B, D)
+                    aleatoric_log_std_t0 = learn_output['pred_metrics_log_std'][0]  # (B, A, D)
+                    aleatoric_log_std_t0 = self._apply_metrics_calibration(aleatoric_log_std_t0)
+                    aleatoric_log_std_t0 = torch.clamp(aleatoric_log_std_t0, min=-10.0, max=10.0)
+                    aleatoric_std_t0 = torch.exp(aleatoric_log_std_t0)  # (B, A, D)
+                    sigma_u_sq = ((w.unsqueeze(1) * aleatoric_std_t0) ** 2).sum(dim=-1)  # (B, A)
+                    sigma_u = torch.sqrt(sigma_u_sq + 1e-8)  # (B, A)
+                    aleatoric_sigma_u_taken_t0 = sigma_u[batch_range, action[0]].mean().item()
+
+        calib_log_t_scalars = self._calibration_scalar_dict()
 
         return {
             'cur_lr': self._optimizer.defaults['lr'],
             'grad_norm': grad_norm,
             'total_loss': loss.item(),
             'metrics_loss': metrics_loss_val,
+            'metrics_loss_unweighted': metrics_loss_val,
+            'is_weighted_metrics_loss': metrics_loss_val,
+            'weighted_minus_unweighted_metrics_loss': 0.0,
             'metrics_w_aug_loss': 0.0 if w_aug_loss_raw is None else float(w_aug_loss_raw.item()),
             'priority': td_error_per_sample.tolist(),  # note abs operation has been performed above
+            'priority_is_weighted_loss': 0.0,
+            'is_weight_mean': 1.0,
+            'is_weight_max': 1.0,
+            'is_weight_min': 1.0,
+            **stats,
             **loss_stats,
-            **(uncertainty_stats if 'uncertainty_stats' in locals() else self._compute_uncertainty_metrics_stats(
-                torch.zeros((1, 1, self._metrics_dim), device=q_value.device, dtype=q_value.dtype),
-                torch.zeros((1, 1, self._metrics_dim), device=q_value.device, dtype=q_value.dtype),
-                None,
-                prefix='metrics_',
-            )),
+            # Keep the raw list for debugging, but don't rely on it for TB scalars.
+            **calib_log_t_scalars,
             # the first timestep in the sequence, may not be the start of episode
             'q_s_taken-a_t0': q_s_a_t0.mean().item(),
             'target_q_s_max-a_t0': target_q_s_a_t0.mean().item(),
@@ -1135,7 +1233,7 @@ class R2D2Policy(Policy):
             'u_true_t0': 0.0 if u_true_t0 is None else u_true_t0.mean().item(),
             'u_abs_err_t0': 0.0 if u_abs_err_t0 is None else u_abs_err_t0.mean().item(),
             'epistemic_std_taken_t0': 0.0 if epistemic_std_taken_t0 is None else float(epistemic_std_taken_t0),
-            **coverage_gap_stats,
+            'aleatoric_sigma_u_taken_t0': 0.0 if aleatoric_sigma_u_taken_t0 is None else float(aleatoric_sigma_u_taken_t0),
             '[histogram]q_s_taken_t0': q_s_a_t0.detach().cpu(),
             '[histogram]target_return_t0': target_return_t0.detach().cpu(),
             '[histogram]q_minus_target_return_t0': (q_s_a_t0.detach() - target_return_t0).detach().cpu(),
@@ -1150,11 +1248,17 @@ class R2D2Policy(Policy):
             'model': self._learn_model.state_dict(),
             'optimizer': self._optimizer.state_dict(),
         }
+        if self._metrics_log_t is not None:
+            state['metrics_log_t'] = self._metrics_log_t.detach().cpu()
+            state['metrics_calibration_step'] = int(self._metrics_calibration_step)
         return state
 
     def _load_state_dict_learn(self, state_dict: Dict[str, Any]) -> None:
         self._learn_model.load_state_dict(state_dict['model'])
         self._optimizer.load_state_dict(state_dict['optimizer'])
+        if self._metrics_log_t is not None and 'metrics_log_t' in state_dict:
+            self._metrics_log_t.copy_(state_dict['metrics_log_t'].to(self._metrics_log_t.device))
+            self._metrics_calibration_step = int(state_dict.get('metrics_calibration_step', 0))
 
     def _init_collect(self) -> None:
         r"""
@@ -1177,78 +1281,6 @@ class R2D2Policy(Policy):
         )
         self._collect_model.reset()
 
-    def _resolve_action_selection_cfg(self, mode: str) -> Tuple[str, float, float]:
-        if mode == 'collect':
-            cfg = self._cfg.collect
-            exploration_type = str(getattr(cfg, 'exploration_type', 'eps_greedy'))
-            ucb_beta = float(getattr(cfg, 'ucb_beta', 1.0))
-            risk_alpha = float(getattr(cfg, 'risk_alpha', 0.0))
-            return exploration_type, ucb_beta, risk_alpha
-        if mode == 'eval':
-            eval_cfg = self._cfg.eval
-            action_selection = str(getattr(eval_cfg, 'action_selection', 'mean')).lower()
-            if action_selection == 'collect':
-                collect_cfg = self._cfg.collect
-                exploration_type = getattr(eval_cfg, 'exploration_type', None)
-                if exploration_type is None:
-                    exploration_type = getattr(collect_cfg, 'exploration_type', 'eps_greedy')
-                ucb_beta = getattr(eval_cfg, 'ucb_beta', None)
-                if ucb_beta is None:
-                    ucb_beta = getattr(collect_cfg, 'ucb_beta', 1.0)
-                risk_alpha = getattr(eval_cfg, 'risk_alpha', None)
-                if risk_alpha is None:
-                    risk_alpha = getattr(collect_cfg, 'risk_alpha', 0.0)
-                return str(exploration_type), float(ucb_beta), float(risk_alpha)
-            elif action_selection == 'mean':
-                return 'mean', 0.0, 0.0
-            elif action_selection in ('mean_risk', 'mean-minus-risk', 'mean_minus_risk'):
-                risk_alpha = getattr(eval_cfg, 'risk_alpha', None)
-                if risk_alpha is None:
-                    risk_alpha = getattr(self._cfg.collect, 'risk_alpha', 0.0)
-                return 'mean_risk', 0.0, float(risk_alpha)
-            raise ValueError(
-                f"Unknown eval action_selection: {action_selection}. "
-                "Expected one of ['collect', 'mean', 'mean_risk']."
-            )
-        raise ValueError(f"Unknown action selection mode: {mode}")
-
-    def _score_and_select_action(
-        self,
-        mean: torch.Tensor,
-        epistemic_std: Optional[torch.Tensor],
-        aleatoric_sigma_u: Optional[torch.Tensor],
-        mode: str,
-        eps: float = 0.0,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        exploration_type, ucb_beta, risk_alpha = self._resolve_action_selection_cfg(mode)
-        if epistemic_std is None:
-            epistemic_std = torch.zeros_like(mean)
-        sigma_u = torch.zeros_like(mean) if aleatoric_sigma_u is None else aleatoric_sigma_u
-
-        # Eval modes are explicit and deterministic.
-        if mode == 'eval' and exploration_type == 'mean':
-            score = mean
-        elif mode == 'eval' and exploration_type == 'mean_risk':
-            score = mean - risk_alpha * sigma_u
-        elif exploration_type == 'ucb':
-            score = mean + ucb_beta * epistemic_std - risk_alpha * sigma_u
-        elif exploration_type == 'thompson':
-            score = mean + epistemic_std * torch.randn_like(epistemic_std)
-            score = score - risk_alpha * sigma_u
-        elif exploration_type in ('mean', 'eps_greedy'):
-            score = mean
-        else:
-            raise ValueError(f"Unknown exploration type/action selection: {exploration_type}")
-
-        greedy_action = score.argmax(dim=-1)
-        action = greedy_action.long()
-        if mode == 'collect' and eps > 0:
-            action_num = mean.shape[-1]
-            random_action = torch.randint(0, action_num, action.shape, device=action.device)
-            use_random_action = torch.rand(action.shape, device=action.device) < eps
-            action = torch.where(use_random_action, random_action, action)
-        return action, score, greedy_action
-
     def _forward_collect(self, data: dict, eps: float, data_id: List[int] = None) -> dict:
         r"""
         Overview:
@@ -1268,6 +1300,8 @@ class R2D2Policy(Policy):
         if self._cuda:
             data = to_device(data, self._device)
         obs = data
+        exploration_type = getattr(self._cfg.collect, 'exploration_type', 'eps_greedy')
+        ucb_beta = float(getattr(self._cfg.collect, 'ucb_beta', 1.0))
 
         # 1) Decide action using the current hidden state, but do not mutate hidden state during MC sampling.
         # HiddenStateWrapper maintains state in self._collect_model._state (a dict keyed by data_id).
@@ -1281,15 +1315,56 @@ class R2D2Policy(Policy):
             mean = out['logit']
             # 1. 提取 Epistemic Uncertainty (认知不确定性，用于探索)
             epistemic_std = out.get('logit_std', torch.zeros_like(mean))
-            aleatoric_sigma_u = out.get('aleatoric_sigma_u', torch.zeros_like(mean))
-            action, score, greedy_action = self._score_and_select_action(
-                mean, epistemic_std, aleatoric_sigma_u, mode='collect', eps=eps
-            )
-            action_num = mean.shape[-1]
 
-            random_prob = mean.new_full(action.shape, float(eps) / float(action_num))
-            greedy_prob = mean.new_full(action.shape, 1.0 - float(eps))
-            propensity = random_prob + greedy_prob * (action == greedy_action).to(mean.dtype)
+            # 2. 提取 Aleatoric Uncertainty (偶然不确定性，用于风险回避)
+            # 注意：这需要你在 q_learning.py 的 _ensemble_head_num == 1 或多头分支中，
+            # 确保 inference=True 时把 'pred_metrics_log_std' 返回到 out 字典里
+            aleatoric_log_std = out.get('pred_metrics_log_std', None)
+
+            # 安全地提取 w，防止 obs 是 dict 导致崩溃
+            obs_tensor = self._extract_obs_tensor(obs)
+            w = self._extract_preference_w(obs_tensor)  # (B, D)
+
+            # 3. 正确合成效用的 Aleatoric 抖动 (sigma_u)
+            if aleatoric_log_std is not None:
+                # 假设各 metric 之间独立: Var(u) = sum( w_i^2 * Var(m_i) )
+                aleatoric_log_std = self._apply_metrics_calibration(aleatoric_log_std)
+                # Avoid overflow if calibration pushes values out of head clamp range.
+                aleatoric_log_std = torch.clamp(aleatoric_log_std, min=-10.0, max=10.0)
+                aleatoric_std = torch.exp(aleatoric_log_std)  # (B, A, D)
+                w_expanded = w.unsqueeze(1)  # (B, 1, D)
+                # 计算方差和
+                sigma_u_sq = ((w_expanded * aleatoric_std) ** 2).sum(dim=-1)  # (B, A)
+                # 开方得到效用 u 的标准差，加 1e-8 防止数值下溢导致 nan (虽然这里是 no_grad)
+                sigma_u = torch.sqrt(sigma_u_sq + 1e-8)
+            else:
+                sigma_u = torch.zeros_like(mean)
+
+            # 获取超参数
+            risk_alpha = float(getattr(self._cfg.collect, 'risk_alpha', 0.0)) # 风险厌恶惩罚系数
+
+            # 4. 计算最终 Score (UCB 探索未知 + 惩罚高风险)
+            if exploration_type == 'ucb':
+                # mean + 乐观探索 - 风险回避
+                score = mean + ucb_beta * epistemic_std - risk_alpha * sigma_u
+            elif exploration_type == 'thompson':
+                # 修复 std 未定义: 从后验分布 (mean, epistemic_std) 中采样
+                score = mean + epistemic_std * torch.randn_like(epistemic_std) 
+                # 同样施加环境固有抖动的惩罚
+                score = score - risk_alpha * sigma_u
+            else: # eps_greedy 或其他
+                score = mean - risk_alpha * sigma_u
+
+            greedy_action = score.argmax(dim=-1)
+
+            action_dim = int(mean.shape[-1])
+            # Epsilon mixture on top of greedy/UCB action. This keeps behavior policy simple and records propensity.
+            rand = torch.rand_like(greedy_action.float())
+            random_action = torch.randint(0, action_dim, greedy_action.shape, device=greedy_action.device)
+            take_random = rand < float(eps)
+            action = torch.where(take_random, random_action, greedy_action).long()
+            # Propensity is exact for eps-greedy / UCB+eps. For Thompson, this is only an approximation.
+            propensity = (float(eps) / action_dim) + (1.0 - float(eps)) * (action == greedy_action).float()
 
             # 2) Advance hidden state exactly once via wrapper forward.
             output = self._collect_model.forward({'obs': obs}, data_id=data_id, inference=True)
@@ -1304,18 +1379,16 @@ class R2D2Policy(Policy):
             output['ucb_score_taken'] = score[batch_range, action]  # (B,)
             output['ucb_score_max'] = score.max(dim=-1)[0]  # (B,)
             output['epistemic_std_taken'] = epistemic_std[batch_range, action]  # (B,)
-            output['aleatoric_sigma_u_taken'] = aleatoric_sigma_u[batch_range, action]  # (B,)
-            output['q_value_all'] = mean  # (B, A)
-            output['ucb_score_all'] = score  # (B, A)
+            output['aleatoric_sigma_u_taken'] = sigma_u[batch_range, action]  # (B,)
 
-            # If model predicts metrics, also log taken prediction.
+            # If model predicts metrics, also log taken prediction and aleatoric std per metric.
             if 'pred_metrics' in out:
                 pm = out['pred_metrics']  # (B, A, D)
-                output['pred_metrics_all'] = pm
                 output['pred_metrics_taken'] = pm[batch_range, action]
-            if 'pred_metrics_log_std' in out:
-                pmls = out['pred_metrics_log_std']  # (B, A, D)
-                output['pred_metrics_std_taken'] = pmls.exp()[batch_range, action]
+                if 'pred_metrics_log_std' in out and out['pred_metrics_log_std'] is not None:
+                    pms = self._apply_metrics_calibration(out['pred_metrics_log_std'])
+                    pms = torch.clamp(pms, min=-10.0, max=10.0)
+                    output['pred_metrics_std_taken'] = torch.exp(pms)[batch_range, action]
         if self._cuda:
             output = to_device(output, 'cpu')
         output = default_decollate(output)
@@ -1370,12 +1443,8 @@ class R2D2Policy(Policy):
             Init eval model with argmax strategy.
         """
         self._metrics_dim = self._get_metrics_dim()
-        self._eval_model = model_wrap(
-            self._model,
-            wrapper_name='hidden_state',
-            state_num=self._cfg.eval.env_num * self._cfg.eval.max_agent_num,
-            save_prev_state=True,
-        )
+        self._eval_model = model_wrap(self._model, wrapper_name='hidden_state', state_num=self._cfg.eval.env_num * self._cfg.eval.max_agent_num)
+        self._eval_model = model_wrap(self._eval_model, wrapper_name='argmax_sample')
         self._eval_model.reset()
 
     def _forward_eval(self, data: dict, data_id: List[int] = None) -> dict:
@@ -1394,56 +1463,10 @@ class R2D2Policy(Policy):
         data = default_collate(list(data.values()))
         if self._cuda:
             data = to_device(data, self._device)
-        obs = data
+        data = {'obs': data}
         self._eval_model.eval()
         with torch.no_grad():
-            prev_state = [self._eval_model._state[i] for i in data_id]
-            model_inp = {'obs': obs, 'prev_state': prev_state}
-            base_model = self._eval_model._model
-            out = base_model.forward(model_inp, inference=True)
-            mean = out['logit']
-            epistemic_std = out.get('logit_std', torch.zeros_like(mean))
-            aleatoric_sigma_u = out.get('aleatoric_sigma_u', torch.zeros_like(mean))
-            action, score, _ = self._score_and_select_action(mean, epistemic_std, aleatoric_sigma_u, mode='eval', eps=0.0)
-            exploration_type, ucb_beta, risk_alpha = self._resolve_action_selection_cfg('eval')
-            eval_cfg = self._cfg.eval
-            collect_cfg = self._cfg.collect
-            log_ucb_beta = getattr(eval_cfg, 'ucb_beta', None)
-            if log_ucb_beta is None:
-                log_ucb_beta = getattr(collect_cfg, 'ucb_beta', 1.0)
-            ucb_bonus = torch.zeros_like(mean)
-            if log_ucb_beta != 0.0:
-                ucb_bonus = float(log_ucb_beta) * epistemic_std
-            greedy_action_by_mean = mean.argmax(dim=-1)
-            greedy_action_by_ucb = (mean + ucb_bonus).argmax(dim=-1)
-
-            output = self._eval_model.forward({'obs': obs}, data_id=data_id, inference=True)
-            output['action'] = action
-            if 'logit' not in output:
-                output['logit'] = mean
-            if 'logit_std' in out:
-                output['logit_std'] = out['logit_std']
-            output['eval_score'] = score
-            batch_range = torch.arange(action.shape[0], device=action.device)
-            output['q_value_taken'] = mean[batch_range, action]
-            output['q_value_max'] = mean.max(dim=-1)[0]
-            output['ucb_score_taken'] = score[batch_range, action]
-            output['ucb_score_max'] = score.max(dim=-1)[0]
-            output['epistemic_std_taken'] = epistemic_std[batch_range, action]
-            output['aleatoric_sigma_u_taken'] = aleatoric_sigma_u[batch_range, action]
-            output['ucb_bonus_taken'] = ucb_bonus[batch_range, action]
-            output['ucb_bonus_max'] = ucb_bonus.max(dim=-1)[0]
-            output['ucb_action_changed_by_bonus'] = (greedy_action_by_ucb != greedy_action_by_mean).to(mean.dtype)
-            output['ucb_counterfactual_action'] = greedy_action_by_ucb
-            output['q_value_all'] = mean
-            output['ucb_score_all'] = score
-            if 'pred_metrics' in out:
-                pm = out['pred_metrics']
-                output['pred_metrics_all'] = pm
-                output['pred_metrics_taken'] = pm[batch_range, action]
-            if 'pred_metrics_log_std' in out:
-                pmls = out['pred_metrics_log_std']
-                output['pred_metrics_std_taken'] = pmls.exp()[batch_range, action]
+            output = self._eval_model.forward(data, data_id=data_id, inference=True)
         if self._cuda:
             output = to_device(output, 'cpu')
         output = default_decollate(output)
@@ -1460,19 +1483,33 @@ class R2D2Policy(Policy):
             'grad_norm',
             'total_loss',
             'metrics_loss',
+            'metrics_loss_unweighted',
+            'is_weighted_metrics_loss',
+            'weighted_minus_unweighted_metrics_loss',
             'metrics_w_aug_loss',
             'priority',
+            'priority_is_weighted_loss',
+            'is_weight_mean',
+            'is_weight_max',
+            'is_weight_min',
             'metrics_loss_abs_err_mean',
             'metrics_loss_abs_err_max',
             'metrics_loss_rmse',
             'metrics_loss_diff_std',
             'metrics_loss_loss_elem_mean',
+            'metrics_loss_nll_mean',
             'metrics_loss_huber_mean',
             'metrics_loss_huber_scaled_mean',
             'metrics_loss_huber_quadratic_frac',
+            'metrics_loss_std_mean',
+            'metrics_loss_var_mean',
             'metrics_loss_beta',
             'metrics_loss_huber_weight',
+            'metrics_loss_use_nll',
             'metrics_loss_use_huber',
+            # Heteroscedastic uncertainty monitoring
+            'metrics_has_log_std',
+            'metrics_nll',
             'metrics_coverage_50',
             'metrics_coverage_80',
             'metrics_coverage_90',
@@ -1488,15 +1525,10 @@ class R2D2Policy(Policy):
             'u_true_t0',
             'u_abs_err_t0',
             'epistemic_std_taken_t0',
-            'action_frac_0',
-            'action_frac_1',
-            'action_frac_2',
-            'pred_gap_l1_01',
-            'pred_gap_l1_02',
-            'pred_gap_l1_12',
-            'pred_gap_l2_01',
-            'pred_gap_l2_02',
-            'pred_gap_l2_12',
-            'pred_gap_l1_mean',
+            'aleatoric_sigma_u_taken_t0',
         ]
+        for i in range(self._metrics_dim):
+            vars.append(f'metrics_nll_dim{i}')
+            vars.append(f'metrics_calib_log_t_{i}')
+            vars.append(f'metrics_calib_t_{i}')
         return vars

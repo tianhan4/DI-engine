@@ -20,6 +20,13 @@ class DiscreteHead(nn.Module):
         activation: Optional[nn.Module] = nn.ReLU(),
         norm_type: Optional[str] = None,
         noise: Optional[bool] = False,
+        metrics_dim: int = 4,
+        action_conditioned_metrics: bool = False,
+        action_embed_dim: Optional[int] = None,
+        gaussian_metrics: bool = False,
+        log_std_min: float = -5.0,
+        log_std_max: float = 2.0,
+        sigma_eps: float = 1e-8,
     ) -> None:
         r"""
         Overview:
@@ -38,42 +45,89 @@ class DiscreteHead(nn.Module):
         super(DiscreteHead, self).__init__()
         layer = NoiseLinearLayer if noise else nn.Linear
         block = noise_block if noise else fc_block
-        self.Q = nn.Sequential(
-            MLP(
-                hidden_size,
+        self._feat = MLP(
+            hidden_size,
+            hidden_size,
+            hidden_size,
+            layer_num,
+            layer_fn=layer,
+            activation=activation,
+            norm_type=norm_type
+        )
+        self._metrics_dim = int(metrics_dim)
+        if self._metrics_dim <= 0:
+            raise ValueError(f"metrics_dim must be positive, got {self._metrics_dim}")
+        self._output_size = int(output_size)
+        self._action_conditioned_metrics = bool(action_conditioned_metrics)
+        self._action_embed_dim = int(action_embed_dim or min(hidden_size, 32))
+        self._gaussian_metrics = bool(gaussian_metrics)
+        self._log_std_min = float(log_std_min)
+        self._log_std_max = float(log_std_max)
+        self._sigma_eps = float(sigma_eps)
+        if self._action_conditioned_metrics:
+            self._action_embed = nn.Embedding(self._output_size, self._action_embed_dim)
+            self._metrics_feat = MLP(
+                hidden_size + self._action_embed_dim,
                 hidden_size,
                 hidden_size,
                 layer_num,
                 layer_fn=layer,
                 activation=activation,
                 norm_type=norm_type
-            ), block(hidden_size, output_size)
-        )
+            )
+            self._metrics_out = block(hidden_size, self._metrics_dim)
+            if self._gaussian_metrics:
+                self._metrics_log_std_out = block(hidden_size, self._metrics_dim)
+        else:
+            self._out = block(hidden_size, self._metrics_dim * self._output_size)
+            if self._gaussian_metrics:
+                self._out_log_std = block(hidden_size, self._metrics_dim * self._output_size)
 
-    def forward(self, x: torch.Tensor) -> Dict:
+    def forward(self, x: torch.Tensor, w: torch.Tensor) -> Dict:
         r"""
         Overview:
-            Use encoded embedding tensor to predict discrete output.
-            Parameter updates with DiscreteHead's MLPs forward setup.
+            Use encoded embedding tensor to predict discrete output with weighting vector.
         Arguments:
-            - x (:obj:`torch.Tensor`):
-                The encoded embedding tensor, determined with given ``hidden_size``, i.e. ``(B, N=hidden_size)``.
+            - x (:obj:`torch.Tensor`): Input feature of shape (B, hidden_size)
+            - w (:obj:`torch.Tensor`): Weight vector of shape (B, metrics_dim)
         Returns:
-            - outputs (:obj:`Dict`):
-                Run ``MLP`` with ``DiscreteHead`` setups
-                and return the result prediction dictionary.
-
-                Necessary Keys:
-                    - logit (:obj:`torch.Tensor`): Logit tensor with same size as input ``x``.
-
-        Examples:
-            >>> head = DiscreteHead(64, 64)
-            >>> inputs = torch.randn(4, 64)
-            >>> outputs = head(inputs)
-            >>> assert isinstance(outputs, dict) and outputs['logit'].shape == torch.Size([4, 64])
+            - outputs (:obj:`Dict`): Output logits of shape (B, output_size)
         """
-        logit = self.Q(x)
-        return {'logit': logit}
+        feat = self._feat(x)
+        if w.shape[-1] != self._metrics_dim:
+            raise RuntimeError(f"Expected w last dim {self._metrics_dim}, got {w.shape[-1]}")
+        if self._action_conditioned_metrics:
+            batch_size = feat.shape[0]
+            action_ids = torch.arange(self._output_size, device=feat.device)
+            action_emb = self._action_embed(action_ids).unsqueeze(0).expand(batch_size, -1, -1)
+            feat_expand = feat.unsqueeze(1).expand(-1, self._output_size, -1)
+            cond_feat = torch.cat([feat_expand, action_emb], dim=-1).reshape(batch_size * self._output_size, -1)
+            cond_out = self._metrics_feat(cond_feat)
+            out = self._metrics_out(cond_out).view(batch_size, self._output_size, self._metrics_dim)
+            pred_log_std = None
+            if self._gaussian_metrics:
+                pred_log_std = self._metrics_log_std_out(cond_out).view(batch_size, self._output_size, self._metrics_dim)
+        else:
+            out = self._out(feat)
+            batch_size = out.shape[0]
+            output_size = out.shape[1] // self._metrics_dim
+            out = out.view(batch_size, output_size, self._metrics_dim)
+            pred_log_std = None
+            if self._gaussian_metrics:
+                pred_log_std = self._out_log_std(feat)
+                pred_log_std = pred_log_std.view(batch_size, output_size, self._metrics_dim)
+        logit = (out * w.unsqueeze(1)).sum(dim=-1)
+        outputs = {'logit': logit, 'pred_metrics': out}
+        if pred_log_std is not None:
+            pred_log_std = pred_log_std.clamp(min=self._log_std_min, max=self._log_std_max)
+            sigma_m = pred_log_std.exp()
+            sigma_u = torch.sqrt(((w.unsqueeze(1) * sigma_m) ** 2).sum(dim=-1) + self._sigma_eps)
+            outputs.update({
+                'pred_metrics_log_std': pred_log_std,
+                'aleatoric_sigma_u': sigma_u,
+            })
+        return outputs
+        
 
 
 class DistributionHead(nn.Module):
@@ -463,6 +517,13 @@ class DuelingHead(nn.Module):
         activation: Optional[nn.Module] = nn.ReLU(),
         norm_type: Optional[str] = None,
         noise: Optional[bool] = False,
+        metrics_dim: int = 4,
+        action_conditioned_metrics: bool = False,
+        action_embed_dim: Optional[int] = None,
+        gaussian_metrics: bool = False,
+        log_std_min: float = -5.0,
+        log_std_max: float = 2.0,
+        sigma_eps: float = 1e-8,
     ) -> None:
         r"""
         Overview:
@@ -480,23 +541,42 @@ class DuelingHead(nn.Module):
             - noise (:obj:`bool`): Whether use noisy ``fc_block``
         """
         super(DuelingHead, self).__init__()
+        if gaussian_metrics:
+            raise NotImplementedError("Gaussian metrics head is only implemented for DiscreteHead in this repo.")
         if a_layer_num is None:
             a_layer_num = layer_num
         if v_layer_num is None:
             v_layer_num = layer_num
         layer = NoiseLinearLayer if noise else nn.Linear
         block = noise_block if noise else fc_block
-        self.A = nn.Sequential(
-            MLP(
-                hidden_size,
-                hidden_size,
-                hidden_size,
-                a_layer_num,
-                layer_fn=layer,
-                activation=activation,
-                norm_type=norm_type
-            ), block(hidden_size, output_size)
-        )
+        self._output_size = int(output_size)
+        self._action_conditioned_metrics = bool(action_conditioned_metrics)
+        self._action_embed_dim = int(action_embed_dim or min(hidden_size, 32))
+        if self._action_conditioned_metrics:
+            self._action_embed = nn.Embedding(self._output_size, self._action_embed_dim)
+            self.A = nn.Sequential(
+                MLP(
+                    hidden_size + self._action_embed_dim,
+                    hidden_size,
+                    hidden_size,
+                    a_layer_num,
+                    layer_fn=layer,
+                    activation=activation,
+                    norm_type=norm_type
+                ), block(hidden_size, int(metrics_dim))
+            )
+        else:
+            self.A = nn.Sequential(
+                MLP(
+                    hidden_size,
+                    hidden_size,
+                    hidden_size,
+                    a_layer_num,
+                    layer_fn=layer,
+                    activation=activation,
+                    norm_type=norm_type
+                ), block(hidden_size, int(metrics_dim) * self._output_size)
+            )
         self.V = nn.Sequential(
             MLP(
                 hidden_size,
@@ -506,10 +586,13 @@ class DuelingHead(nn.Module):
                 layer_fn=layer,
                 activation=activation,
                 norm_type=norm_type
-            ), block(hidden_size, 1)
+            ), block(hidden_size, int(metrics_dim))
         )
+        self._metrics_dim = int(metrics_dim)
+        if self._metrics_dim <= 0:
+            raise ValueError(f"metrics_dim must be positive, got {self._metrics_dim}")
 
-    def forward(self, x: torch.Tensor) -> Dict:
+    def forward(self, x: torch.Tensor, w: torch.Tensor) -> Dict:
         r"""
         Overview:
             Use encoded embedding tensor to predict Dueling output.
@@ -517,23 +600,36 @@ class DuelingHead(nn.Module):
         Arguments:
             - x (:obj:`torch.Tensor`):
                 The encoded embedding tensor, determined with given ``hidden_size``, i.e. ``(B, N=hidden_size)``.
+            - w (:obj:`torch.Tensor`): Weight vector of shape (B, metrics_dim)
         Returns:
             - outputs (:obj:`Dict`):
                 Run ``MLP`` with ``DuelingHead`` setups and return the result prediction dictionary.
 
                 Necessary Keys:
                     - logit (:obj:`torch.Tensor`): Logit tensor with same size as input ``x``.
-        Examples:
-            >>> head = DuelingHead(64, 64)
-            >>> inputs = torch.randn(4, 64)
-            >>> outputs = head(inputs)
-            >>> assert isinstance(outputs, dict)
-            >>> assert outputs['logit'].shape == torch.Size([4, 64])
         """
-        a = self.A(x)
-        v = self.V(x)
+        num_rows = x.shape[0]
+        if w.shape[-1] != self._metrics_dim:
+            raise RuntimeError(f"Expected w last dim {self._metrics_dim}, got {w.shape[-1]}")
+        if self._action_conditioned_metrics:
+            action_ids = torch.arange(self._output_size, device=x.device)
+            action_emb = self._action_embed(action_ids).unsqueeze(0).expand(num_rows, -1, -1)
+            x_expand = x.unsqueeze(1).expand(-1, self._output_size, -1)
+            cond_in = torch.cat([x_expand, action_emb], dim=-1).reshape(num_rows * self._output_size, -1)
+            ta = self.A(cond_in).view(num_rows, self._output_size, self._metrics_dim)
+        else:
+            ta = self.A(x) # batch_size, metrics_dim*output_size
+            num_cols = ta.shape[1] // self._metrics_dim
+            ta = ta.view(num_rows, num_cols, self._metrics_dim)
+        a = (ta * w.unsqueeze(1)).sum(dim=-1)
+        tv = self.V(x)
+        num_cols = tv.shape[1] // self._metrics_dim
+        tv = tv.view(num_rows, num_cols, self._metrics_dim)
+        v = (tv * w.unsqueeze(1)).sum(dim=-1)
+        
+        pred_metrics = ta - ta.mean(dim=1, keepdim=True) + tv
         logit = a - a.mean(dim=-1, keepdim=True) + v
-        return {'logit': logit}
+        return {'logit': logit, 'pred_metrics': pred_metrics}
 
 
 class RegressionHead(nn.Module):

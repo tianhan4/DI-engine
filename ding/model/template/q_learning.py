@@ -529,6 +529,38 @@ class RainbowDQN(nn.Module):
         return x
 
 
+def myparallel_wrapper(forward_fn: Callable) -> Callable:
+    r"""
+    Overview:
+        Process timestep T and batch_size B at the same time, in other words, treat different timestep data as
+        different trajectories in a batch.
+    Arguments:
+        - forward_fn (:obj:`Callable`): Normal ``nn.Module`` 's forward function.
+    Returns:
+        - wrapper (:obj:`Callable`): Wrapped function.
+    """
+
+    def wrapper(x: torch.Tensor, w: torch.Tensor) -> Union[torch.Tensor, List[torch.Tensor]]:
+        T, B = x.shape[:2]
+        # print("x,shape: ", x.shape)
+        # print("w.shape: ", w.shape)
+        def reshape(d):
+            if isinstance(d, list):
+                d = [reshape(t) for t in d]
+            elif isinstance(d, dict):
+                d = {k: reshape(v) for k, v in d.items()}
+            else:
+                d = d.reshape(T, B, *d.shape[1:])
+            return d
+
+        x = x.reshape(T * B, *x.shape[2:])
+        w = w.reshape(T * B, *w.shape[2:])
+        x = forward_fn(x, w)
+        x = reshape(x)
+        return x
+
+    return wrapper
+
 def parallel_wrapper(forward_fn: Callable) -> Callable:
     r"""
     Overview:
@@ -572,13 +604,21 @@ class DRQN(nn.Module):
             obs_shape: Union[int, SequenceType],
             action_shape: Union[int, SequenceType],
             encoder_hidden_size_list: SequenceType = [128, 128, 64],
-            dueling: bool = True,
+            dueling: bool = False,
             head_hidden_size: Optional[int] = None,
             head_layer_num: int = 1,
             lstm_type: Optional[str] = 'normal',
             activation: Optional[nn.Module] = nn.ReLU(),
             norm_type: Optional[str] = None,
-            res_link: bool = False
+            res_link: bool = False,
+            ensemble_head_num: int = 1,
+            metrics_dim: int = 4,
+            action_conditioned_metrics_head: bool = False,
+            action_embed_dim: Optional[int] = None,
+            gaussian_metrics_head: bool = False,
+            metrics_log_std_min: float = -5.0,
+            metrics_log_std_max: float = 2.0,
+            metrics_sigma_eps: float = 1e-8,
     ) -> None:
         r"""
         Overview:
@@ -599,17 +639,32 @@ class DRQN(nn.Module):
         super(DRQN, self).__init__()
         # For compatibility: 1, (1, ), [4, 32, 32]
         obs_shape, action_shape = squeeze(obs_shape), squeeze(action_shape)
+        self._metrics_dim = int(metrics_dim)
+        if self._metrics_dim <= 0:
+            raise ValueError(f"metrics_dim must be positive, got {self._metrics_dim}")
+        # This repo assumes the last metrics_dim dims of obs are preference vector w.
+        if isinstance(obs_shape, int):
+            if obs_shape <= self._metrics_dim:
+                raise ValueError(
+                    f"obs_shape must be > {self._metrics_dim} to include state + {self._metrics_dim}-dim preference w, got {obs_shape}"
+                )
+            encoder_obs_shape = obs_shape - self._metrics_dim
+        elif isinstance(obs_shape, (tuple, list)) and len(obs_shape) == 1:
+            if obs_shape[0] <= self._metrics_dim:
+                raise ValueError(
+                    f"obs_shape[0] must be > {self._metrics_dim} to include state + {self._metrics_dim}-dim preference w, got {obs_shape[0]}"
+                )
+            encoder_obs_shape = [obs_shape[0] - self._metrics_dim]
+        else:
+            raise RuntimeError(
+                f"DRQN in this repo expects 1D obs with last {self._metrics_dim} dims as preference w, got obs_shape={obs_shape}"
+            )
         if head_hidden_size is None:
             head_hidden_size = encoder_hidden_size_list[-1]
         # FC Encoder
-        if isinstance(obs_shape, int) or len(obs_shape) == 1:
-            self.encoder = FCEncoder(obs_shape, encoder_hidden_size_list, activation=activation, norm_type=norm_type)
-        # Conv Encoder
-        elif len(obs_shape) == 3:
-            self.encoder = ConvEncoder(obs_shape, encoder_hidden_size_list, activation=activation, norm_type=norm_type)
-        else:
-            raise RuntimeError(
-                "not support obs_shape for pre-defined encoder: {}, please customize your own DRQN".format(obs_shape)
+        if isinstance(encoder_obs_shape, int) or len(encoder_obs_shape) == 1:
+            self.encoder = FCEncoder(
+                encoder_obs_shape, encoder_hidden_size_list, activation=activation, norm_type=norm_type
             )
         # LSTM Type
         self.rnn = get_lstm(lstm_type, input_size=head_hidden_size, hidden_size=head_hidden_size)
@@ -620,20 +675,34 @@ class DRQN(nn.Module):
         else:
             head_cls = DiscreteHead
         multi_head = not isinstance(action_shape, int)
+        head_kwargs = dict(layer_num=head_layer_num, activation=activation, norm_type=norm_type)
+        head_kwargs['metrics_dim'] = self._metrics_dim
+        head_kwargs['action_conditioned_metrics'] = bool(action_conditioned_metrics_head)
+        head_kwargs['action_embed_dim'] = action_embed_dim
+        head_kwargs['gaussian_metrics'] = bool(gaussian_metrics_head)
+        head_kwargs['log_std_min'] = metrics_log_std_min
+        head_kwargs['log_std_max'] = metrics_log_std_max
+        head_kwargs['sigma_eps'] = metrics_sigma_eps
+
         if multi_head:
-            self.head = MultiHead(
-                head_cls,
-                head_hidden_size,
-                action_shape,
-                layer_num=head_layer_num,
-                activation=activation,
-                norm_type=norm_type
+            # Not used in this repo's 3-action discrete bandit setup.
+            raise NotImplementedError(
+                "MultiHead with preference-weighted Discrete/Dueling heads is not supported in this repo."
             )
         else:
-            self.head = head_cls(
-                head_hidden_size, action_shape, head_layer_num, activation=activation, norm_type=norm_type
-            )
-
+            self._ensemble_head_num = int(ensemble_head_num) # 集成头数
+            if self._ensemble_head_num < 1: # 如果集成头数小于1，则抛出错误
+                raise ValueError(f"ensemble_head_num must be  = 1, got {self._ensemble_head_num}")
+            if self._ensemble_head_num == 1: # 如果集成头数为1，则使用单个头
+                self.head = head_cls(head_hidden_size, action_shape, **head_kwargs)
+            else: # 如果集成头数大于1，则使用多个头
+                # Shared encoder + shared RNN, multiple independent heads for epistemic uncertainty.
+                self.heads = nn.ModuleList([head_cls(head_hidden_size, action_shape, **head_kwargs)
+                                            for _ in range(self._ensemble_head_num)])
+                # 创建一个包含多个头的模块列表，每个头都使用相同的参数配置。
+                # 这样，在训练过程中，每个头可以独立地进行预测，从而产生不同的预测结果。
+                # 这对于不确定性估计（如 MC-dropout）特别有用，因为它允许模型在不同的时间步或不同的数据子集上进行预测，并计算这些预测结果的方差。
+                # 通过这种方式，可以更准确地估计不确定性，并提供更可靠的决策支持。
     def forward(
             self, inputs: Dict, inference: bool = False, saved_hidden_state_timesteps: Optional[list] = None
     ) -> Dict:
@@ -681,10 +750,22 @@ class DRQN(nn.Module):
         """
 
         x, prev_state = inputs['obs'], inputs['prev_state']
+        metrics = inputs.get('metrics', None)
+
+        # print("x.shape: ", x.shape)
+        # print("x : ", x)
         # for both inference and other cases, the network structure is encoder -> rnn network -> head
         # the difference is inference take the data with seq_len=1 (or T = 1)
+        # print("q_learninglwb")
+        # print("x.shape: ", x.shape)
         if inference:
-            x = self.encoder(x)
+            if x.shape[-1] < self._metrics_dim:
+                raise RuntimeError(
+                    f"DRQN inference expects obs with last {self._metrics_dim} dims as preference w, got shape={tuple(x.shape)}"
+                )
+            w = x[:, -self._metrics_dim:]
+            x = x[:, :-self._metrics_dim]
+            x = self.encoder(x)  # 现在输入是5维，匹配 encoder 的 in_features
             if self.res_link:
                 a = x
             x = x.unsqueeze(0)  # for rnn input, put the seq_len of x as 1 instead of none.
@@ -693,12 +774,61 @@ class DRQN(nn.Module):
             x = x.squeeze(0)  # to delete the seq_len dim to match head network input
             if self.res_link:
                 x = x + a
-            x = self.head(x)
-            x['next_state'] = next_state
-            return x
+            if getattr(self, '_ensemble_head_num', 1) == 1:
+                out = self.head(x, w)
+                out['next_state'] = next_state
+                return out
+            else:
+                logits = []
+                pred_metrics = []
+                pred_metrics_log_std = []
+                aleatoric_sigma_u = []
+                for head in self.heads:
+                    h_out = head(x, w)
+                    logits.append(h_out['logit'])
+                    if 'pred_metrics' in h_out:
+                        pred_metrics.append(h_out['pred_metrics'])
+                    if 'pred_metrics_log_std' in h_out:
+                        pred_metrics_log_std.append(h_out['pred_metrics_log_std'])
+                    if 'aleatoric_sigma_u' in h_out:
+                        aleatoric_sigma_u.append(h_out['aleatoric_sigma_u'])
+                logits = torch.stack(logits, dim=0)  # (E,B,A)
+                out = {
+                    'logit': logits.mean(dim=0),
+                    'logit_std': logits.std(dim=0, unbiased=False),
+                    'logit_ens': logits,
+                    'next_state': next_state,
+                }
+                if len(pred_metrics) == len(self.heads):
+                    pm = torch.stack(pred_metrics, dim=0)  # (E,B,A,D)
+                    out.update({
+                        'pred_metrics': pm.mean(dim=0), 
+                        'pred_metrics_std': pm.std(dim=0, unbiased=False),
+                        'pred_metrics_ens': pm, 
+                    })
+                if len(pred_metrics_log_std) == len(self.heads):
+                    pls = torch.stack(pred_metrics_log_std, dim=0)  # (E,B,A,D)
+                    out.update({
+                        'pred_metrics_log_std': pls.mean(dim=0),
+                        'pred_metrics_log_std_ens': pls,
+                    })
+                if len(aleatoric_sigma_u) == len(self.heads):
+                    asu = torch.stack(aleatoric_sigma_u, dim=0)  # (E,B,A)
+                    out.update({
+                        'aleatoric_sigma_u': asu.mean(dim=0),
+                        'aleatoric_sigma_u_std': asu.std(dim=0, unbiased=False),
+                        'aleatoric_sigma_u_ens': asu,
+                    })
+                return out
         else:
             assert len(x.shape) in [3, 5], x.shape
-            x = parallel_wrapper(self.encoder)(x)  # (T, B, N)
+            if x.shape[-1] < self._metrics_dim:
+                raise RuntimeError(
+                    f"DRQN training expects obs with last {self._metrics_dim} dims as preference w, got shape={tuple(x.shape)}"
+                )
+            w = x[:, :, -self._metrics_dim:]
+            x = x[:, :, :-self._metrics_dim]
+            x = parallel_wrapper(self.encoder)(x)  # 输入就变成了 (T, B, 5)，匹配 encoder
             if self.res_link:
                 a = x
             lstm_embedding = []
@@ -717,7 +847,55 @@ class DRQN(nn.Module):
             x = torch.cat(lstm_embedding, 0)  # (T, B, head_hidden_size)
             if self.res_link:
                 x = x + a
-            x = parallel_wrapper(self.head)(x)  # (T, B, action_shape)
+            if getattr(self, '_ensemble_head_num', 1) == 1:
+                x = myparallel_wrapper(self.head)(x, w)  # (T, B, action_shape)
+            else:
+                T, B = x.shape[:2]
+                x_flat = x.reshape(T * B, *x.shape[2:])
+                w_flat = w.reshape(T * B, *w.shape[2:])
+                logits = []
+                pred_metrics = []
+                pred_metrics_log_std = []
+                aleatoric_sigma_u = []
+                for head in self.heads:
+                    h_out = head(x_flat, w_flat)
+                    logits.append(h_out['logit'].reshape(T, B, *h_out['logit'].shape[1:]))
+                    if 'pred_metrics' in h_out:
+                        pred_metrics.append(h_out['pred_metrics'].reshape(T, B, *h_out['pred_metrics'].shape[1:]))
+                    if 'pred_metrics_log_std' in h_out:
+                        pred_metrics_log_std.append(
+                            h_out['pred_metrics_log_std'].reshape(T, B, *h_out['pred_metrics_log_std'].shape[1:])
+                        )
+                    if 'aleatoric_sigma_u' in h_out:
+                        aleatoric_sigma_u.append(
+                            h_out['aleatoric_sigma_u'].reshape(T, B, *h_out['aleatoric_sigma_u'].shape[1:])
+                        )
+                logits = torch.stack(logits, dim=0)  # (E,T,B,A)
+                x = {
+                    'logit': logits.mean(dim=0),
+                    'logit_std': logits.std(dim=0, unbiased=False),
+                    'logit_ens': logits,
+                }
+                if len(pred_metrics) == len(self.heads):
+                    pm = torch.stack(pred_metrics, dim=0)  # (E,T,B,A,D)
+                    x.update({
+                        'pred_metrics': pm.mean(dim=0), #预测的均值的均值
+                        'pred_metrics_std': pm.std(dim=0, unbiased=False), #预测的均值的方差
+                        'pred_metrics_ens': pm, 
+                    })
+                if len(pred_metrics_log_std) == len(self.heads):
+                    pls = torch.stack(pred_metrics_log_std, dim=0)  # (E,T,B,A,D)
+                    x.update({
+                        'pred_metrics_log_std': pls.mean(dim=0),
+                        'pred_metrics_log_std_ens': pls,
+                    })
+                if len(aleatoric_sigma_u) == len(self.heads):
+                    asu = torch.stack(aleatoric_sigma_u, dim=0)  # (E,T,B,A)
+                    x.update({
+                        'aleatoric_sigma_u': asu.mean(dim=0),
+                        'aleatoric_sigma_u_std': asu.std(dim=0, unbiased=False),
+                        'aleatoric_sigma_u_ens': asu,
+                    })
             # the last timestep state including h and c for lstm, {list: B{tuple: 2{Tensor:(1, 1, head_hidden_size}}}
             x['next_state'] = prev_state
             # all hidden state h, this returns a tensor of the dim: seq_len*batch_size*head_hidden_size
